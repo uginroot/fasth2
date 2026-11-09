@@ -1,0 +1,45 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.24.x', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  h2spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install h2spec
+        run: |
+          curl -sSL https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz | tar xz
+          sudo mv h2spec /usr/local/bin/
+      - name: Build
+        run: |
+          go build -o fasth2server ./cmd/fasth2server
+          go build -o muxapp ./cmd/muxapp
+      - name: Conformance (inline, async, net/http drop-in over TLS)
+        run: |
+          ./fasth2server -addr :8085 &
+          ./fasth2server -addr :8086 -async &
+          ./muxapp -addr :8093 -fasth2 -tls &
+          sleep 2
+          fail=0
+          for args in "-p 8085" "-p 8086" "-t -k -p 8093"; do
+            h2spec -h 127.0.0.1 $args -o 5 > out.txt 2>&1 || true
+            tail -1 out.txt
+            grep -q ", 0 failed" out.txt || { cat out.txt; fail=1; }
+          done
+          exit $fail

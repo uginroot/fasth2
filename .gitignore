@@ -1,0 +1,5 @@
+/fasth2server
+/muxapp
+*.test
+*.prof
+*.out
