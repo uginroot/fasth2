@@ -12,34 +12,61 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
+      - name: HPACK corpus (http2jp/hpack-test-case)
+        run: git clone --depth 1 https://github.com/http2jp/hpack-test-case /tmp/hpack-test-case
       - run: go vet ./...
+      - run: go test -race -count=1 -v -run 'HPACKTestCase' ./...
+        env:
+          HPACK_TEST_CASE_DIR: /tmp/hpack-test-case
       - run: go test -race -count=1 ./...
 
-  h2spec:
+  conformance:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      - name: Install h2spec
+      - name: Install h2spec, nghttp2 clients
         run: |
           curl -sSL https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz | tar xz
           sudo mv h2spec /usr/local/bin/
-      - name: Build
+          sudo apt-get update -qq && sudo apt-get install -y -qq nghttp2-client
+      - name: Build and start servers
         run: |
           go build -o fasth2server ./cmd/fasth2server
           go build -o muxapp ./cmd/muxapp
-      - name: Conformance (inline, async, net/http drop-in over TLS)
-        run: |
           ./fasth2server -addr :8085 &
           ./fasth2server -addr :8086 -async &
           ./muxapp -addr :8093 -fasth2 -tls &
           sleep 2
+      - name: h2spec (inline, async, net/http drop-in over TLS)
+        run: |
           fail=0
           for args in "-p 8085" "-p 8086" "-t -k -p 8093"; do
             h2spec -h 127.0.0.1 $args -o 5 > out.txt 2>&1 || true
-            tail -1 out.txt
+            echo "h2spec $args: $(tail -1 out.txt)"
             grep -q ", 0 failed" out.txt || { cat out.txt; fail=1; }
           done
           exit $fail
+      - name: Interop (curl, nghttp, h2load)
+        run: scripts/interop.sh
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzHPACKDecode, FuzzHuffmanDecode, FuzzHuffmanRoundTrip, FuzzConnInline, FuzzConnAsync]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 90s .
+      - name: Upload failing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: testdata/fuzz

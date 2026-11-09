@@ -73,15 +73,27 @@ Scripts: `scripts/bench_native.sh`, `scripts/bench_mux.sh`.
 
 ## Testing
 
-```sh
-go test -race ./...                     # RFC 7541 vectors, interop with net/http client,
-                                        # TLS/h2c drop-in, gorilla/mux, ServeMux, ctx cancel, Shutdown
-go build ./cmd/fasth2server && ./fasth2server -addr :8085 &
-h2spec -h 127.0.0.1 -p 8085             # 146/146
-```
+Every push runs in CI:
 
-CI runs vet, race tests (Go 1.24 and stable) and h2spec against the inline, async
-and drop-in (TLS) servers on every push.
+| suite | what it checks |
+|---|---|
+| [h2spec](https://github.com/summerwind/h2spec) | 146 RFC 7540/7541 conformance tests against inline, async and the `net/http` drop-in (TLS) |
+| [hpack-test-case](https://github.com/http2jp/hpack-test-case) | 47,142 header blocks encoded by 14 independent HPACK encoders (nghttp2, Go, node, python, haskell, swift-nio) |
+| RFC 7541 Appendix C | official HPACK examples with and without Huffman coding |
+| interop | curl, nghttp and h2load (h2c and TLS), Go `net/http` client, HTTP/1.1 fallback |
+| compatibility | `net/http` drop-in: gorilla/mux, `http.ServeMux`, context cancellation, `Shutdown`, large bodies |
+| fuzzing | `go test -fuzz` on the HPACK decoder, Huffman codec and whole connections (arbitrary frames after a valid preface), inline and async; panics and hangs fail the run |
+| race detector | all tests run with `-race` on Go 1.24 and the latest Go |
+
+Locally:
+
+```sh
+go test -race ./...
+git clone --depth 1 https://github.com/http2jp/hpack-test-case /tmp/htc
+HPACK_TEST_CASE_DIR=/tmp/htc go test -run HPACKTestCase -v .
+go test -run '^$' -fuzz '^FuzzConnAsync$' -fuzztime 5m .
+go build ./cmd/fasth2server && ./fasth2server -addr :8085 & h2spec -h 127.0.0.1 -p 8085
+```
 
 ## Limitations
 

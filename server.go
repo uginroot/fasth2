@@ -431,10 +431,18 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 	c.serve()
 }
 
+// panicHook is called with a recovered connection-level panic. Tests set it
+// to re-panic so that fuzzing and race tests surface bugs instead of
+// silently dropping the connection.
+var panicHook func(any)
+
 func (c *conn) serve() {
 	defer func() {
 		if r := recover(); r != nil {
 			c.nc.Close()
+			if panicHook != nil {
+				panicHook(r)
+			}
 		}
 	}()
 	c.mu.Lock()
