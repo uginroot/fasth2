@@ -1,13 +1,9 @@
-// Package fasth2 is a minimal, allocation-free (in steady state) HTTP/2
-// server (h2c, prior knowledge). Design borrows from hyper/h2:
-//   - one goroutine per connection, no goroutine/channel per stream;
-//   - all frames produced while processing one read are flushed with a
-//     single write syscall;
+// Package fasth2 replaces the HTTP/2 implementation of a net/http server
+// (see ConfigureServer). Design borrows from hyper/h2:
+//   - one reader goroutine per connection, no goroutine/channel per frame;
+//   - handlers run on pooled worker goroutines and may block; frames from
+//     many workers are coalesced into few write syscalls;
 //   - reusable buffers for frames, header blocks, requests and responses.
-//
-// By default handlers run inline on the connection goroutine and must not
-// block. With Server.Async handlers run on a pooled worker goroutine and may
-// block; responses from many workers are still coalesced into few writes.
 package fasth2
 
 import (
@@ -99,30 +95,25 @@ type connError uint32
 
 func (connError) Error() string { return "http2: connection error" }
 
-// Request is valid only for the duration of the handler call.
-type Request struct {
-	RemoteAddr string
-	TLS        *tls.ConnectionState
-	StreamID   uint32
-	Method     []byte
-	Path       []byte
-	Scheme     []byte
-	Authority  []byte
-	Header     []HeaderField // regular (non-pseudo) headers
-	Body       []byte
+// request is valid only for the duration of the handler call; its slices
+// alias stream buffers.
+type request struct {
+	remoteAddr string
+	tls        *tls.ConnectionState
+	method     []byte
+	path       []byte
+	authority  []byte
+	header     []headerField // regular (non-pseudo) headers
+	body       []byte
 
 	c  *conn
 	st *stream
 }
 
-// Context returns the request context. In Async mode it is canceled when the
-// client resets the stream or the connection goes away. In inline mode it is
-// the connection's base context.
-func (r *Request) Context() context.Context {
+// context returns the request context. It is canceled when the client resets
+// the stream, the connection goes away or the handler returns.
+func (r *request) context() context.Context {
 	c, st := r.c, r.st
-	if !c.async {
-		return c.baseCtx
-	}
 	if st.ctx != nil { // only the owning worker touches ctx creation
 		return st.ctx
 	}
@@ -137,54 +128,35 @@ func (r *Request) Context() context.Context {
 	return ctx
 }
 
-// HeaderValue returns the first value of a (lowercase) header.
-func (r *Request) HeaderValue(name string) []byte {
-	for i := range r.Header {
-		if string(r.Header[i].Name) == name {
-			return r.Header[i].Value
-		}
-	}
-	return nil
-}
-
-// Response is reused between requests on a connection.
-type Response struct {
+// response is reused between requests on a connection.
+type response struct {
 	status        int
 	contentLength int64  // -1: use len(body)
 	hdr           []byte // pre-encoded HPACK fields
 	body          []byte
 }
 
-func (r *Response) reset() {
+func (r *response) reset() {
 	r.status = 200
 	r.contentLength = -1
 	r.hdr = r.hdr[:0]
 	r.body = r.body[:0]
 }
 
-func (r *Response) SetStatus(code int) { r.status = code }
+// addHeader adds a response header. name must be a lowercase token and value
+// must be valid (the net/http adapter checks both). content-length is added
+// automatically.
+func (r *response) addHeader(name, value string) { r.hdr = appendLiteral(r.hdr, name, value) }
 
-// AddHeader adds a response header. name must be lowercase.
-// content-length is added automatically.
-func (r *Response) AddHeader(name, value string) { r.hdr = appendLiteral(r.hdr, name, value) }
+func (r *response) write(p []byte)       { r.body = append(r.body, p...) }
+func (r *response) writeString(s string) { r.body = append(r.body, s...) }
 
-func (r *Response) Write(p []byte) (int, error) {
-	r.body = append(r.body, p...)
-	return len(p), nil
-}
+type handlerFunc func(req *request, resp *response)
 
-func (r *Response) WriteString(s string) (int, error) {
-	r.body = append(r.body, s...)
-	return len(s), nil
-}
-
-type Handler func(req *Request, resp *Response)
-
-// Server is an HTTP/2 server. For timeouts zero means the default and a
-// negative value disables the timeout. With ConfigureServer, a zero field
-// takes the corresponding http.Server value when that one is set.
+// Server holds the HTTP/2 settings of ConfigureServer. For timeouts zero means
+// the default and a negative value disables the timeout. A zero field takes
+// the corresponding http.Server value when that one is set.
 type Server struct {
-	Handler Handler
 	// MaxConcurrentStreams limits open streams per connection, including
 	// streams the client reset while their handler still runs. Default 250.
 	MaxConcurrentStreams uint32
@@ -215,13 +187,9 @@ type Server struct {
 	// http.Server.WriteTimeout.
 	WriteByteTimeout time.Duration
 
-	// ErrorLog receives handler panics. Nil means the log package's standard
-	// logger (or http.Server.ErrorLog with ConfigureServer).
+	// ErrorLog receives handler panics. Nil means http.Server.ErrorLog, else
+	// the log package's standard logger.
 	ErrorLog *log.Logger
-
-	// Async runs each handler on a pooled worker goroutine, so handlers may
-	// block (DB calls, I/O). Inline mode (false) is faster for CPU-only handlers.
-	Async bool
 
 	poolOnce sync.Once
 	pool     *workerPool
@@ -230,9 +198,10 @@ type Server struct {
 	conns  map[*conn]struct{}
 }
 
-// Shutdown sends GOAWAY to every connection; each connection is closed once
-// its in-flight streams finish. It does not wait.
-func (s *Server) Shutdown() {
+// shutdown sends GOAWAY to every connection; each connection is closed once
+// its in-flight streams finish. It does not wait. Registered with
+// http.Server.RegisterOnShutdown.
+func (s *Server) shutdown() {
 	s.connMu.Lock()
 	cs := make([]*conn, 0, len(s.conns))
 	for c := range s.conns {
@@ -309,24 +278,6 @@ func (w *worker) run(p *workerPool, t task) {
 	}
 }
 
-func (s *Server) ListenAndServe(addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-	return s.Serve(ln)
-}
-
-func (s *Server) Serve(ln net.Listener) error {
-	for {
-		nc, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go s.ServeConn(nc)
-	}
-}
-
 type stream struct {
 	id         uint32
 	halfClosed bool // END_STREAM received
@@ -339,7 +290,7 @@ type stream struct {
 	dataLen    int64
 	regStart   int
 	arena      []byte
-	fields     []HeaderField
+	fields     []headerField
 	method     []byte
 	path       []byte
 	scheme     []byte
@@ -348,14 +299,14 @@ type stream struct {
 	out        []byte
 	ctx        context.Context
 	cancel     context.CancelFunc
-	inHandler  bool // owned by a worker goroutine (async mode)
+	inHandler  bool // owned by a worker goroutine
 	canceled   bool // stream went away while its handler was running
 	orphan     bool // released while inHandler; still counts toward maxConc
 	// deadline: request must be fully received by then (before dispatch), or
 	// a flow-blocked response must make progress by then (pending).
 	deadline time.Time
-	req      Request
-	resp     Response
+	req      request
+	resp     response
 }
 
 func (s *stream) reset(id uint32, sendWin int64) {
@@ -391,9 +342,8 @@ const (
 )
 
 type conn struct {
-	srv   *Server
-	nc    net.Conn
-	async bool
+	srv *Server
+	nc  net.Conn
 
 	// mu guards all connection state below except the read buffer, which is
 	// owned by the reader goroutine.
@@ -427,7 +377,7 @@ type conn struct {
 	iwWindow time.Time // SETTINGS INITIAL_WINDOW_SIZE rate limit
 	iwCount  int
 
-	handler    Handler
+	handler    handlerFunc
 	baseCtx    context.Context
 	remoteAddr string
 	tlsState   *tls.ConnectionState
@@ -444,8 +394,7 @@ type conn struct {
 	streams map[uint32]*stream
 	pending []*stream
 	free    []*stream
-	scratch stream
-	discard stream
+	discard stream // decodes header blocks of refused streams and trailers
 
 	lastStreamID uint32
 	ring         [ringSize]closedEntry
@@ -466,15 +415,10 @@ type conn struct {
 	hbKind      int
 	hbEndStream bool
 	hbSelfDep   bool
-
-	req  Request
-	resp Response
 }
 
-func (s *Server) ServeConn(nc net.Conn) { s.serveConn(nc, connOpts{}) }
-
 type connOpts struct {
-	handler    Handler
+	handler    handlerFunc
 	ctx        context.Context
 	tls        *tls.ConnectionState
 	sawPreface bool
@@ -517,12 +461,9 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 		maxConnBody:    s.MaxConnBodySize,
 		maxHeaderList:  s.MaxHeaderListSize,
 		errorLog:       s.ErrorLog,
-		async:          s.Async,
 	}
 	c.wcond.L = &c.mu
-	if s.Async {
-		s.poolOnce.Do(func() { s.pool = &workerPool{} })
-	}
+	s.poolOnce.Do(func() { s.pool = &workerPool{} })
 	if c.maxConc <= 0 {
 		c.maxConc = defaultMaxStreams
 	}
@@ -558,9 +499,6 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 	c.rdl = c.hsDeadline
 	nc.SetReadDeadline(c.rdl)
 	nc.SetWriteDeadline(time.Time{})
-	if c.handler == nil {
-		c.handler = s.Handler
-	}
 	if c.baseCtx == nil {
 		c.baseCtx = context.Background()
 	}
@@ -1058,7 +996,7 @@ func (c *conn) closeStream(st *stream) {
 }
 
 func (c *conn) release(st *stream) {
-	if st == &c.scratch || st == &c.discard {
+	if st == &c.discard {
 		return
 	}
 	delete(c.streams, st.id)
@@ -1171,9 +1109,6 @@ func (c *conn) onHeaders(flags byte, sid uint32, p []byte) error {
 		switch {
 		case len(c.streams)+c.orphans >= c.maxConc || c.goingAway:
 			kind = kindRefuse
-		case endStream && !c.async:
-			st = &c.scratch
-			st.reset(sid, c.peerInitWindow)
 		default:
 			st = c.newStream(sid)
 			c.streams[sid] = st
@@ -1249,7 +1184,7 @@ func (c *conn) finishHeaders(sid uint32, st *stream, kind int, endStream, selfDe
 		}
 		return c.dispatch(st)
 	}
-	// kindNew. resetStream also handles the inline scratch stream.
+	// kindNew
 	if tooLarge {
 		c.rejectHeaderTooLarge(st, endStream)
 		return nil
@@ -1408,7 +1343,7 @@ func equalFold(a, b []byte) bool {
 	return true
 }
 
-func validTrailers(fields []HeaderField) bool {
+func validTrailers(fields []headerField) bool {
 	for i := range fields {
 		if !validFieldName(fields[i].Name) || !validFieldValue(fields[i].Value) {
 			return false
@@ -1633,55 +1568,25 @@ func (c *conn) onWindowUpdate(sid uint32, p []byte) error {
 
 // ---------------- responses ----------------
 
+// dispatch hands a fully received request to a worker goroutine.
 func (c *conn) dispatch(st *stream) error {
 	st.deadline = time.Time{} // request fully received; handler time is not limited here
-	if c.async {
-		st.inHandler = true
-		c.srv.pool.submit(task{c, st})
-		return nil
-	}
-	req := &c.req
-	req.c, req.st, req.RemoteAddr, req.TLS = c, st, c.remoteAddr, c.tlsState
-	req.StreamID = st.id
-	req.Method, req.Path, req.Scheme, req.Authority = st.method, st.path, st.scheme, st.authority
-	if st.regStart >= 0 {
-		req.Header = st.fields[st.regStart:]
-	} else {
-		req.Header = nil
-	}
-	req.Body = st.body
-	resp := &c.resp
-	resp.reset()
-	if !c.callInline(req, resp) {
-		c.resetStream(st, codeInternal)
-		return nil
-	}
-	return c.writeResponse(st, resp)
+	st.inHandler = true
+	c.srv.pool.submit(task{c, st})
+	return nil
 }
 
-// callInline runs an inline handler; a panic resets only its stream.
-func (c *conn) callInline(req *Request, resp *Response) (ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.logPanic(r)
-		}
-	}()
-	c.handler(req, resp)
-	return true
-}
-
-// runHandler executes on a worker goroutine (async mode).
+// runHandler executes on a worker goroutine.
 func (c *conn) runHandler(st *stream) {
 	req, resp := &st.req, &st.resp
-	req.c, req.st, req.RemoteAddr, req.TLS = c, st, c.remoteAddr, c.tlsState
-	req.StreamID = st.id
-	req.Method, req.Path, req.Scheme, req.Authority = st.method, st.path, st.scheme, st.authority
+	req.c, req.st, req.remoteAddr, req.tls = c, st, c.remoteAddr, c.tlsState
+	req.method, req.path, req.authority = st.method, st.path, st.authority
 	if st.regStart >= 0 {
-		req.Header = st.fields[st.regStart:]
+		req.header = st.fields[st.regStart:]
 	} else {
-		req.Header = nil
+		req.header = nil
 	}
-	req.Body = st.body
+	req.body = st.body
 	resp.reset()
 	panicked := true
 	func() {
@@ -1718,7 +1623,7 @@ func (c *conn) runHandler(st *stream) {
 	}
 }
 
-func (c *conn) writeResponse(st *stream, resp *Response) error {
+func (c *conn) writeResponse(st *stream, resp *response) error {
 	hb := appendStatus(c.hbuf[:0], resp.status)
 	hb = append(hb, resp.hdr...)
 	if resp.status != 204 && resp.status != 304 {
@@ -1740,13 +1645,6 @@ func (c *conn) writeResponse(st *stream, resp *Response) error {
 	if len(rem) == 0 {
 		c.closeStream(st)
 		return nil
-	}
-	if st == &c.scratch { // blocked by flow control: promote to a real stream
-		nst := c.newStream(st.id)
-		nst.sendWindow = st.sendWindow
-		nst.halfClosed, nst.gotHeaders = true, true
-		st = nst
-		c.streams[st.id] = st
 	}
 	st.out = append(st.out[:0], rem...)
 	st.pending = true

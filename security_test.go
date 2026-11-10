@@ -133,7 +133,7 @@ func respFields(t *testing.T, f tframe) map[string]string {
 	t.Helper()
 	d := newDecoder()
 	var arena []byte
-	var fields []HeaderField
+	var fields []headerField
 	if _, err := d.decode(f.p, &arena, &fields, 1<<20); err != nil {
 		t.Fatal(err)
 	}
@@ -242,17 +242,6 @@ func startMux(t *testing.T, hs *http.Server, s *Server) (string, *Server) {
 	go hs.Serve(ln)
 	t.Cleanup(func() { hs.Close() })
 	return ln.Addr().String(), s
-}
-
-func startNative(t *testing.T, s *Server) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go s.Serve(ln)
-	t.Cleanup(func() { ln.Close(); s.Shutdown() })
-	return ln.Addr().String()
 }
 
 func connCount(s *Server) int {
@@ -389,7 +378,7 @@ func TestSecConnErrorWhileWriteBlocked(t *testing.T) {
 	}
 }
 
-func TestSecHandlerPanicAsync(t *testing.T) {
+func TestSecHandlerPanic(t *testing.T) {
 	var logbuf syncBuffer
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/panic" {
@@ -409,33 +398,6 @@ func TestSecHandlerPanicAsync(t *testing.T) {
 	}
 	if !strings.Contains(logbuf.String(), "panic serving") {
 		t.Fatalf("panic not logged to http.Server.ErrorLog: %q", logbuf.String())
-	}
-}
-
-func TestSecHandlerPanicInlineNoDeadlock(t *testing.T) {
-	old := panicHook
-	panicHook = nil // production behaviour
-	defer func() { panicHook = old }()
-	s := &Server{ErrorLog: log.New(io.Discard, "", 0), Handler: func(req *Request, resp *Response) {
-		if string(req.Path) == "/panic" {
-			panic("boom")
-		}
-		resp.WriteString("ok")
-	}}
-	addr := startNative(t, s)
-	c := dialH2(t, addr, true)
-	c.send(headers(1, true, reqBlock("GET", "/panic")))
-	c.awaitRST(1)
-	c.send(headers(3, true, reqBlock("GET", "/ok")))
-	if st := c.awaitStatus(3); st != "200" {
-		t.Fatalf("status %q, want 200", st)
-	}
-	done := make(chan struct{})
-	go func() { s.Shutdown(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Shutdown hung")
 	}
 }
 
@@ -604,12 +566,13 @@ func TestSecResponseHeaderNames(t *testing.T) {
 }
 
 func TestSecHandshakeTimeout(t *testing.T) {
-	addr := startNative(t, &Server{Async: true, HandshakeTimeout: 200 * time.Millisecond, Handler: func(*Request, *Response) {}})
+	addr, _ := startMux(t, &http.Server{Handler: http.HandlerFunc(okHandler)}, &Server{HandshakeTimeout: 200 * time.Millisecond})
 	nc, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer nc.Close()
+	nc.Write([]byte(clientPreface)) // and no SETTINGS frame
 	nc.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, err := io.Copy(io.Discard, nc); err != nil { // returns at EOF
 		t.Fatalf("connection not closed by the server: %v", err)
@@ -699,10 +662,11 @@ func TestSecExpiredDeadlineDoesNotSpin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	s := &Server{Async: true, HandshakeTimeout: 150 * time.Millisecond, Handler: func(_ *Request, resp *Response) {
+	s := &Server{HandshakeTimeout: 150 * time.Millisecond}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(600 * time.Millisecond) // handshake deadline fires while this runs
-		resp.WriteString("ok")
-	}}
+		okHandler(w, r)
+	})
 	cc := make(chan *countingConn, 1)
 	go func() {
 		nc, err := ln.Accept()
@@ -711,7 +675,7 @@ func TestSecExpiredDeadlineDoesNotSpin(t *testing.T) {
 		}
 		w := &countingConn{Conn: nc}
 		cc <- w
-		s.ServeConn(w)
+		s.serveConn(w, connOpts{handler: httpHandler(h)})
 	}()
 	c := dialH2(t, ln.Addr().String(), true)
 	c.send(headers(1, true, reqGET))
@@ -721,7 +685,7 @@ func TestSecExpiredDeadlineDoesNotSpin(t *testing.T) {
 	if n := (<-cc).reads.Load(); n > 20 {
 		t.Fatalf("%d reads for one request: the reader spun on an expired deadline", n)
 	}
-	s.Shutdown()
+	s.shutdown()
 }
 
 func TestSecTLSPolicy(t *testing.T) {

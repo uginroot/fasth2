@@ -2,8 +2,8 @@ package fasth2
 
 import "errors"
 
-// HeaderField is a decoded header. Slices are valid only during the handler call.
-type HeaderField struct {
+// headerField is a decoded header. Slices are valid only during the handler call.
+type headerField struct {
 	Name, Value []byte
 }
 
@@ -158,7 +158,7 @@ func (d *hpackDecoder) readString(p []byte, arena *[]byte) ([]byte, []byte, erro
 // (the dynamic table must stay in sync with the peer) but stops collecting
 // fields and reports tooLarge. An indexed field costs one byte on the wire
 // but may expand to a 4 KB table entry, so the limit is on the decoded size.
-func (d *hpackDecoder) decode(p []byte, arena *[]byte, fields *[]HeaderField, maxList int) (tooLarge bool, err error) {
+func (d *hpackDecoder) decode(p []byte, arena *[]byte, fields *[]headerField, maxList int) (tooLarge bool, err error) {
 	sawField := false
 	size := 0
 	for len(p) > 0 {
@@ -180,7 +180,7 @@ func (d *hpackDecoder) decode(p []byte, arena *[]byte, fields *[]HeaderField, ma
 				if size > maxList || len(*fields) >= maxHeaderFields {
 					tooLarge = true
 				} else {
-					*fields = append(*fields, HeaderField{n, v})
+					*fields = append(*fields, headerField{n, v})
 				}
 			}
 		case b&0xe0 == 0x20: // dynamic table size update
@@ -233,7 +233,7 @@ func (d *hpackDecoder) decode(p []byte, arena *[]byte, fields *[]HeaderField, ma
 			if tooLarge {
 				*arena = (*arena)[:mark] // field is dropped: do not keep its bytes
 			} else {
-				*fields = append(*fields, HeaderField{name, value})
+				*fields = append(*fields, headerField{name, value})
 			}
 		}
 	}

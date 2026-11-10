@@ -13,16 +13,13 @@ conformance tests and can replace the HTTP/2 implementation of an existing
 
 The design follows hyper/h2 rather than `net/http`:
 
-- one goroutine per connection, no goroutine + channels per stream;
-- all frames produced while handling one socket read leave in a **single `write`**
-  (~0.2 syscalls per request vs ~4 for `net/http`);
-- reusable buffers: **zero allocations per request** in steady state (native API);
-- own HPACK decoder; in async mode responses from many workers are coalesced
-  into shared writes (write combining).
+- one reader goroutine per connection, no goroutine + channels per frame;
+- handlers run on a worker pool; frames from many workers are coalesced into
+  shared writes (write combining), one write per response instead of two;
+- reusable buffers for frames, header blocks, requests and responses;
+- own HPACK decoder.
 
 ## Usage
-
-### Drop-in for an existing `net/http` service
 
 ```go
 srv := &http.Server{Addr: ":8443", Handler: router} // gorilla/mux, chi, http.ServeMux, middleware...
@@ -35,26 +32,16 @@ connections are served by fasth2 (via the standard `http.Server.TLSNextProto`
 hook, Go 1.24+). For h2c enable `srv.Protocols.SetUnencryptedHTTP2(true)` as usual.
 If you build your own `tls.Listener`, add `"h2"` to `NextProtos`.
 
-### Native API (fastest)
-
-```go
-srv := &fasth2.Server{Handler: func(req *fasth2.Request, resp *fasth2.Response) {
-	resp.AddHeader("content-type", "text/plain")
-	resp.WriteString("Hello, World!")
-}}
-log.Fatal(srv.ListenAndServe(":8080")) // h2c, prior knowledge
-```
-
-Handlers run inline on the connection goroutine and **must not block**.
-Set `Async: true` to run them on a worker pool (they may then block on DB/RPC calls).
+Handlers run on fasth2 worker goroutines and may block, like under `net/http`.
+To change limits and timeouts, pass a `*fasth2.Server` instead of `nil` (see below).
 
 ## Benchmarks
 
 h2load, "Hello, World!" response, 1 vCPU shared by server and load generator,
-Go 1.27.3, Rust 1.75 + hyper 1.4. Requests/second (connections × streams per connection).
+Go 1.27.3. Requests/second (connections × streams per connection). Same gorilla/mux
+app, only `ConfigureServer` differs. Measured before the connection limits and
+timeouts were added; in a local comparison they cost 0–4% CPU per request.
 Re-measure on your own hardware.
-
-**Drop-in** (same gorilla/mux app, only `ConfigureServer` differs):
 
 | route, load | h2c net/http → fasth2 | TLS net/http → fasth2 |
 |---|---|---|
@@ -62,14 +49,7 @@ Re-measure on your own hardware.
 | `/users/{id}` JSON 100×100 | 25k → 65k (×2.6) | 22k → 61k (×2.7) |
 | `/sleep` (1 ms) 100×100 | 32k → 66k (×2.0) | 30k → 60k (×2.0) |
 
-**Native API:**
-
-| load | net/http | fasth2 inline | fasth2 async | Rust hyper |
-|---|---|---|---|---|
-| 10×10 | 46k | 603k | 300k | 191k |
-| 100×100 | 39k | 932k | 305k | 164k |
-
-Scripts: `scripts/bench_native.sh`, `scripts/bench_mux.sh`.
+Script: `scripts/bench_mux.sh`.
 
 ## Testing
 
@@ -77,12 +57,12 @@ Every push runs in CI:
 
 | suite | what it checks |
 |---|---|
-| [h2spec](https://github.com/summerwind/h2spec) | 146 RFC 7540/7541 conformance tests against inline, async and the `net/http` drop-in (TLS) |
+| [h2spec](https://github.com/summerwind/h2spec) | 146 RFC 7540/7541 conformance tests against the `net/http` drop-in over TLS, and over h2c except 3.5/2 (there `net/http` reads the client preface) |
 | [hpack-test-case](https://github.com/http2jp/hpack-test-case) | 47,142 header blocks encoded by 14 independent HPACK encoders (nghttp2, Go, node, python, haskell, swift-nio) |
 | RFC 7541 Appendix C | official HPACK examples with and without Huffman coding |
 | interop | curl, nghttp and h2load (h2c and TLS), Go `net/http` client, HTTP/1.1 fallback |
 | compatibility | `net/http` drop-in: gorilla/mux, `http.ServeMux`, context cancellation, `Shutdown`, large bodies |
-| fuzzing | `go test -fuzz` on the HPACK decoder, Huffman codec and whole connections (arbitrary frames after a valid preface), inline and async; panics and hangs fail the run |
+| fuzzing | `go test -fuzz` on the HPACK decoder, Huffman codec and whole connections through the `net/http` adapter (arbitrary frames after a valid preface); panics and hangs fail the run |
 | race detector | all tests run with `-race` on Go 1.24 and the latest Go |
 | security | `security_test.go`: Rapid Reset, non-reading client, header-list amplification, SETTINGS flood, blocked writer + connection error, handler panics, slot leak, buffer reuse after the handler returns, field validation, all timeouts, body budget, TLS policy |
 
@@ -92,8 +72,8 @@ Locally:
 go test -race ./...
 git clone --depth 1 https://github.com/http2jp/hpack-test-case /tmp/htc
 HPACK_TEST_CASE_DIR=/tmp/htc go test -run HPACKTestCase -v .
-go test -run '^$' -fuzz '^FuzzConnAsync$' -fuzztime 5m .
-go build ./cmd/fasth2server && ./fasth2server -addr :8085 & h2spec -h 127.0.0.1 -p 8085
+go test -run '^$' -fuzz '^FuzzConn$' -fuzztime 5m .
+go build ./cmd/muxapp && ./muxapp -addr :8086 -fasth2 & h2spec -h 127.0.0.1 -p 8086
 ```
 
 ## Limits and timeouts
@@ -134,7 +114,6 @@ them); `net/http` queues such requests instead.
   (reads/writes from a leftover goroutine get an error).
 - Response headers are HPACK-encoded without the dynamic table (slightly larger headers).
 - Stream priorities are ignored; no server push.
-- Native inline handlers must not block.
 
 ---
 
@@ -142,8 +121,7 @@ them); `net/http` queues such requests instead.
 
 Быстрый HTTP/2-сервер для Go: проходит все 146 тестов h2spec и подменяет HTTP/2
 в существующем `net/http`-сервисе одной строкой `fasth2.ConfigureServer(srv, nil)`.
-В тестах на gorilla/mux-приложении — ускорение ×2–3; нативный API быстрее
-`net/http` в 10–20 раз. Статус — экспериментальный: перед продом прогоните на
+В тестах на gorilla/mux-приложении — ускорение ×2–3. Статус — экспериментальный: перед продом прогоните на
 стейдже и учтите ограничения выше (нет стриминга ответов). Лимиты и таймауты
 соединений включены по умолчанию, `ConfigureServer` берёт их из `http.Server`
 (см. «Limits and timeouts»).

@@ -28,13 +28,12 @@ import (
 // TLS connections below TLS 1.2, or TLS 1.2 without an ECDHE AEAD cipher, are
 // refused with INADEQUATE_SECURITY (RFC 9113 9.2).
 //
-// Handlers run on fasth2 worker goroutines (s.Async is forced on), so they
-// may block exactly like under net/http. s may be nil.
+// Handlers run on fasth2 worker goroutines, so they may block exactly like
+// under net/http. s may be nil.
 func ConfigureServer(hs *http.Server, s *Server) *Server {
 	if s == nil {
 		s = &Server{}
 	}
-	s.Async = true
 	if hs.TLSNextProto == nil {
 		hs.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
 	}
@@ -44,7 +43,7 @@ func ConfigureServer(hs *http.Server, s *Server) *Server {
 			rejectInadequateTLS(tc)
 			return
 		}
-		s.serveConn(tc, connOpts{handler: HTTPHandler(h), ctx: baseContext(h), tls: &cs, hs: hs})
+		s.serveConn(tc, connOpts{handler: httpHandler(h), ctx: baseContext(h), tls: &cs, hs: hs})
 	}
 	// Go 1.24+ hands h2c connections (preface already consumed) to this key.
 	hs.TLSNextProto["unencrypted_http2"] = func(hs *http.Server, tc *tls.Conn, h http.Handler) {
@@ -52,9 +51,9 @@ func ConfigureServer(hs *http.Server, s *Server) *Server {
 		if u, ok := nc.(interface{ UnencryptedNetConn() net.Conn }); ok {
 			nc = u.UnencryptedNetConn()
 		}
-		s.serveConn(nc, connOpts{handler: HTTPHandler(h), ctx: baseContext(h), sawPreface: true, hs: hs})
+		s.serveConn(nc, connOpts{handler: httpHandler(h), ctx: baseContext(h), sawPreface: true, hs: hs})
 	}
-	hs.RegisterOnShutdown(s.Shutdown)
+	hs.RegisterOnShutdown(s.shutdown)
 	return s
 }
 
@@ -76,12 +75,12 @@ func baseContext(h http.Handler) context.Context {
 	return context.Background()
 }
 
-// HTTPHandler adapts a standard http.Handler (http.ServeMux, gorilla/mux,
-// chi, middleware...) to fasth2. Use it with Server.Async = true.
+// httpHandler adapts a standard http.Handler (http.ServeMux, gorilla/mux,
+// chi, middleware...) to fasth2.
 // Not supported: http.Flusher/streaming responses, Hijacker, 1xx responses,
 // request and response trailers. Request bodies are fully buffered.
-func HTTPHandler(h http.Handler) Handler {
-	return func(req *Request, resp *Response) { serveHTTP(h, req, resp) }
+func httpHandler(h http.Handler) handlerFunc {
+	return func(req *request, resp *response) { serveHTTP(h, req, resp) }
 }
 
 func internMethod(b []byte) string {
@@ -138,32 +137,32 @@ func lowerKey(k string) string {
 	return strings.ToLower(k)
 }
 
-func serveHTTP(h http.Handler, req *Request, resp *Response) {
-	method := internMethod(req.Method)
+func serveHTTP(h http.Handler, req *request, resp *response) {
+	method := internMethod(req.method)
 	hr := &http.Request{
 		Method:     method,
 		Proto:      "HTTP/2.0",
 		ProtoMajor: 2,
-		Header:     make(http.Header, len(req.Header)),
-		RemoteAddr: req.RemoteAddr,
-		TLS:        req.TLS,
-		Host:       string(req.Authority),
+		Header:     make(http.Header, len(req.header)),
+		RemoteAddr: req.remoteAddr,
+		TLS:        req.tls,
+		Host:       string(req.authority),
 	}
 	if method == "CONNECT" {
 		hr.URL = &url.URL{Host: hr.Host}
 		hr.RequestURI = hr.Host
 	} else {
-		hr.RequestURI = string(req.Path)
+		hr.RequestURI = string(req.path)
 		u, err := url.ParseRequestURI(hr.RequestURI)
 		if err != nil {
-			resp.SetStatus(400)
+			resp.status = 400
 			return
 		}
 		hr.URL = u
 	}
 	var cookies []string
-	for i := range req.Header {
-		f := &req.Header[i]
+	for i := range req.header {
+		f := &req.header[i]
 		if string(f.Name) == "cookie" { // RFC 9113 8.2.3: re-join cookie crumbs
 			cookies = append(cookies, string(f.Value))
 			continue
@@ -182,21 +181,21 @@ func serveHTTP(h http.Handler, req *Request, resp *Response) {
 		}
 		delete(hr.Header, "Host")
 	}
-	hr.ContentLength = int64(len(req.Body))
+	hr.ContentLength = int64(len(req.body))
 	var body *reqBody
-	if len(req.Body) == 0 {
+	if len(req.body) == 0 {
 		hr.Body = http.NoBody
 	} else {
-		body = &reqBody{b: req.Body}
+		body = &reqBody{b: req.body}
 		hr.Body = body
 	}
-	if ctx := req.Context(); ctx != context.Background() {
+	if ctx := req.context(); ctx != context.Background() {
 		hr = hr.WithContext(ctx)
 	}
 
 	rw := &responseWriter{resp: resp, header: make(http.Header), head: method == "HEAD"}
 	h.ServeHTTP(rw, hr)
-	// req.Body and resp are stream buffers that the next request on this
+	// req.body and resp are stream buffers that the next request on this
 	// connection reuses. Detach them before returning, so a goroutine that
 	// outlives the handler (http.TimeoutHandler does that) gets an error
 	// instead of another request's body or another response.
@@ -244,7 +243,7 @@ var errWriteAfterHandler = errors.New("fasth2: Write after the handler returned"
 
 type responseWriter struct {
 	mu      sync.Mutex
-	resp    *Response
+	resp    *response
 	header  http.Header
 	status  int
 	wrote   bool
@@ -276,7 +275,7 @@ func (w *responseWriter) writeHeaderLocked(code int) {
 	w.wrote = true
 	w.status = code
 	w.clen = -1
-	w.resp.SetStatus(code)
+	w.resp.status = code
 	for k, vs := range w.header {
 		lk := lowerKey(k)
 		if !validFieldName(lk) { // also drops pseudo-header names (":...")
@@ -299,7 +298,7 @@ func (w *responseWriter) writeHeaderLocked(code int) {
 		}
 		for _, v := range vs {
 			if validFieldValue(v) {
-				w.resp.AddHeader(lk, v)
+				w.resp.addHeader(lk, v)
 			}
 		}
 	}
@@ -324,12 +323,13 @@ func (w *responseWriter) writeLocked(p []byte) (int, error) {
 	if w.head {
 		w.headN += int64(len(p))
 		if !w.hasType && w.headN == int64(len(p)) && len(p) > 0 {
-			w.resp.AddHeader("content-type", http.DetectContentType(p))
+			w.resp.addHeader("content-type", http.DetectContentType(p))
 			w.hasType = true
 		}
 		return len(p), nil
 	}
-	return w.resp.Write(p)
+	w.resp.write(p)
+	return len(p), nil
 }
 
 func (w *responseWriter) WriteString(s string) (int, error) {
@@ -344,7 +344,8 @@ func (w *responseWriter) WriteString(s string) (int, error) {
 	if !bodyAllowed(w.status) {
 		return 0, http.ErrBodyNotAllowed
 	}
-	return w.resp.WriteString(s)
+	w.resp.writeString(s)
+	return len(s), nil
 }
 
 func (w *responseWriter) finish() {
@@ -360,10 +361,10 @@ func (w *responseWriter) finish() {
 		if n > 512 {
 			n = 512
 		}
-		w.resp.AddHeader("content-type", http.DetectContentType(body[:n]))
+		w.resp.addHeader("content-type", http.DetectContentType(body[:n]))
 	}
 	if !w.hasDate {
-		w.resp.AddHeader("date", httpDate())
+		w.resp.addHeader("date", httpDate())
 	}
 	if w.head {
 		if w.clen >= 0 {
