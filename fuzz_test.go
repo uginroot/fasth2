@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
+	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -22,8 +25,8 @@ func FuzzHPACKDecode(f *testing.F) {
 		d := newDecoder()
 		for i := 0; i < 2; i++ { // decoder is stateful: decode twice
 			var arena []byte
-			var fields []HeaderField
-			_ = d.decode(data, &arena, &fields)
+			var fields []headerField
+			_, _ = d.decode(data, &arena, &fields, 1<<30)
 			if d.size > d.maxSize || d.maxSize > d.allowed {
 				t.Fatalf("table invariant broken: size=%d max=%d allowed=%d", d.size, d.maxSize, d.allowed)
 			}
@@ -103,16 +106,17 @@ func connSeeds() [][]byte {
 	}
 }
 
-func runFuzzConn(t *testing.T, async bool, data []byte) {
+func runFuzzConn(t *testing.T, data []byte) {
 	srvSide, cliSide := net.Pipe()
-	s := &Server{Async: async, MaxConcurrentStreams: 100, MaxRequestBodySize: 1 << 20,
-		Handler: func(req *Request, resp *Response) {
-			resp.AddHeader("x-path", string(req.Path))
-			resp.Write(req.Body)
-			resp.WriteString("ok")
-		}}
+	var panics panicLog
+	s := &Server{MaxConcurrentStreams: 100, MaxRequestBodySize: 1 << 20, ErrorLog: log.New(&panics, "", 0)}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Path", r.URL.Path)
+		io.Copy(w, r.Body)
+		io.WriteString(w, "ok")
+	})
 	done := make(chan struct{})
-	go func() { s.ServeConn(srvSide); close(done) }()
+	go func() { s.serveConn(srvSide, connOpts{handler: httpHandler(h)}); close(done) }()
 	go io.Copy(io.Discard, cliSide)
 	cliSide.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	cliSide.Write([]byte(clientPreface))
@@ -124,18 +128,33 @@ func runFuzzConn(t *testing.T, async bool, data []byte) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("connection goroutine did not exit (hang)")
 	}
+	if msg := panics.String(); msg != "" {
+		t.Fatalf("panic in the net/http adapter or a worker: %s", msg)
+	}
 }
 
-func FuzzConnInline(f *testing.F) {
+// panicLog collects what the server logs (only handler panics are logged).
+type panicLog struct {
+	mu sync.Mutex
+	b  []byte
+}
+
+func (l *panicLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.b = append(l.b, p...)
+	return len(p), nil
+}
+
+func (l *panicLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return string(l.b)
+}
+
+func FuzzConn(f *testing.F) {
 	for _, s := range connSeeds() {
 		f.Add(s)
 	}
-	f.Fuzz(func(t *testing.T, data []byte) { runFuzzConn(t, false, data) })
-}
-
-func FuzzConnAsync(f *testing.F) {
-	for _, s := range connSeeds() {
-		f.Add(s)
-	}
-	f.Fuzz(func(t *testing.T, data []byte) { runFuzzConn(t, true, data) })
+	f.Fuzz(runFuzzConn)
 }

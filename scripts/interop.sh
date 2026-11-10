@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Interop with independent HTTP/2 clients: curl (libcurl+nghttp2), nghttp, h2load.
-# Expects: fasth2server on :8085 (inline), :8086 (async); muxapp -fasth2 -tls on :8093.
+# Expects: muxapp -fasth2 on :8086 (h2c); muxapp -fasth2 -tls on :8093.
 set -u
 fail=0
 check() { # name, expected, actual
   if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: want [$2] got [$3]"; fail=1; fi
 }
-for p in 8085 8086; do
+for p in 8086; do
   check "curl h2c GET :$p" "Hello, World!|2|200" \
     "$(curl -s --http2-prior-knowledge -w '|%{http_version}|%{http_code}' http://127.0.0.1:$p/)"
   check "curl h2c POST :$p" "Hello, World!|200" \

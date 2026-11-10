@@ -34,16 +34,18 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq nghttp2-client
       - name: Build and start servers
         run: |
-          go build -o fasth2server ./cmd/fasth2server
           go build -o muxapp ./cmd/muxapp
-          ./fasth2server -addr :8085 &
-          ./fasth2server -addr :8086 -async &
+          ./muxapp -addr :8086 -fasth2 &
           ./muxapp -addr :8093 -fasth2 -tls &
           sleep 2
-      - name: h2spec (inline, async, net/http drop-in over TLS)
+      - name: h2spec (net/http drop-in over h2c and TLS)
+        # Over h2c, net/http reads the client preface before handing the
+        # connection to fasth2 and answers garbage as HTTP/1.1, so http2/3.5/2
+        # (invalid preface) tests net/http there; over TLS fasth2 reads it.
         run: |
           fail=0
-          for args in "-p 8085" "-p 8086" "-t -k -p 8093"; do
+          h2c="generic http2/3.5/1 http2/4 http2/5 http2/6 http2/7 http2/8 hpack"
+          for args in "-p 8086 $h2c" "-t -k -p 8093"; do
             h2spec -h 127.0.0.1 $args -o 5 > out.txt 2>&1 || true
             echo "h2spec $args: $(tail -1 out.txt)"
             grep -q ", 0 failed" out.txt || { cat out.txt; fail=1; }
@@ -57,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [FuzzHPACKDecode, FuzzHuffmanDecode, FuzzHuffmanRoundTrip, FuzzConnInline, FuzzConnAsync]
+        target: [FuzzHPACKDecode, FuzzHuffmanDecode, FuzzHuffmanRoundTrip, FuzzConn]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

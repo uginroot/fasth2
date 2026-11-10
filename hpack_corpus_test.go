@@ -50,8 +50,8 @@ func TestHPACKTestCase(t *testing.T) {
 				t.Fatalf("%s #%d: bad hex", f, c.Seqno)
 			}
 			var arena []byte
-			var fields []HeaderField
-			if err := d.decode(wire, &arena, &fields); err != nil {
+			var fields []headerField
+			if _, err := d.decode(wire, &arena, &fields, 1<<30); err != nil {
 				t.Fatalf("%s #%d: %v", f, c.Seqno, err)
 			}
 			if len(fields) != len(c.Headers) {

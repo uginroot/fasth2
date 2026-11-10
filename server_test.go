@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -28,8 +28,8 @@ func runVectors(t *testing.T, blocks []string, want [][]hf, sizes []int) {
 			t.Fatal(err)
 		}
 		var arena []byte
-		var fields []HeaderField
-		if err := d.decode(raw, &arena, &fields); err != nil {
+		var fields []headerField
+		if _, err := d.decode(raw, &arena, &fields, 1<<30); err != nil {
 			t.Fatalf("block %d: %v", i, err)
 		}
 		if len(fields) != len(want[i]) {
@@ -77,30 +77,25 @@ var bigBody = func() []byte {
 }()
 
 func startServer(t *testing.T) string {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	srv := &Server{Handler: func(req *Request, resp *Response) {
-		switch string(req.Path) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
 		case "/echo":
-			resp.AddHeader("x-method", string(req.Method))
-			resp.Write(req.Body)
+			w.Header().Set("X-Method", r.Method)
+			io.Copy(w, r.Body)
 		case "/big":
-			resp.Write(bigBody)
+			w.Write(bigBody)
 		case "/404":
-			resp.SetStatus(404)
+			w.WriteHeader(404)
 		case "/418":
-			resp.SetStatus(418)
-			resp.AddHeader("x-custom-header", strings.Repeat("v", 20000)) // forces CONTINUATION
+			w.Header().Set("X-Custom-Header", strings.Repeat("v", 20000)) // forces CONTINUATION
+			w.WriteHeader(418)
 		default:
-			resp.AddHeader("content-type", "text/plain")
-			resp.WriteString("Hello, World!")
+			w.Header().Set("Content-Type", "text/plain")
+			io.WriteString(w, "Hello, World!")
 		}
-	}}
-	go srv.Serve(ln)
-	return "http://" + ln.Addr().String()
+	})
+	addr, _ := startMux(t, &http.Server{Handler: h}, nil)
+	return "http://" + addr
 }
 
 func h2cClient() *http.Client {
@@ -201,24 +196,19 @@ func TestInteropConcurrent(t *testing.T) {
 	}
 }
 
-// ---- async mode ----
+// ---- handlers on worker goroutines ----
 
-func startAsync(t *testing.T, h Handler) string {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	go (&Server{Async: true, Handler: h}).Serve(ln)
-	return "http://" + ln.Addr().String()
+func startAsync(t *testing.T, h http.HandlerFunc) string {
+	addr, _ := startMux(t, &http.Server{Handler: h, ErrorLog: log.New(io.Discard, "", 0)}, nil)
+	return "http://" + addr
 }
 
 // 200 requests that each block for 100 ms, multiplexed over ONE connection,
 // must finish in ~100 ms (not 20 s): blocking handlers don't block the conn.
 func TestAsyncBlockingHandlers(t *testing.T) {
-	base := startAsync(t, func(req *Request, resp *Response) {
+	base := startAsync(t, func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
-		resp.Write(req.Path)
+		io.WriteString(w, r.URL.Path)
 	})
 	cl := h2cClient()
 	cl.Get(base + "/warmup") // make sure a single connection is established
@@ -252,15 +242,15 @@ func TestAsyncBlockingHandlers(t *testing.T) {
 }
 
 func TestAsyncInterop(t *testing.T) {
-	base := startAsync(t, func(req *Request, resp *Response) {
-		if string(req.Path) == "/panic" {
+	base := startAsync(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/panic" {
 			panic("boom")
 		}
-		if string(req.Path) == "/big" {
-			resp.Write(bigBody)
+		if r.URL.Path == "/big" {
+			w.Write(bigBody)
 			return
 		}
-		resp.Write(req.Body)
+		io.Copy(w, r.Body)
 	})
 	cl := h2cClient()
 	payload := make([]byte, 2<<20)
