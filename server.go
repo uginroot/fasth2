@@ -1291,15 +1291,6 @@ func (c *conn) rejectHeaderTooLarge(st *stream, endStream bool) {
 	c.release(st)
 }
 
-func hasUpper(b []byte) bool {
-	for _, ch := range b {
-		if ch >= 'A' && ch <= 'Z' {
-			return true
-		}
-	}
-	return false
-}
-
 func parseUint(b []byte) (int64, bool) {
 	if len(b) == 0 || len(b) > 18 {
 		return 0, false
@@ -1321,13 +1312,18 @@ const (
 	hasAuthority
 )
 
+// parseRequest extracts pseudo-headers and checks that the request is well
+// formed (RFC 9113 8.2-8.3): field names and values, pseudo-header values,
+// connection-specific fields, content-length, Host vs :authority.
 func parseRequest(st *stream) bool {
 	seen := 0
 	regular := false
+	hosts := 0
+	var host []byte
 	for i := range st.fields {
 		f := &st.fields[i]
 		n := f.Name
-		if len(n) == 0 || hasUpper(n) {
+		if len(n) == 0 {
 			return false
 		}
 		if n[0] == ':' {
@@ -1353,6 +1349,9 @@ func parseRequest(st *stream) bool {
 			seen |= bit
 			continue
 		}
+		if !validFieldName(n) || !validFieldValue(f.Value) {
+			return false
+		}
 		if !regular {
 			regular = true
 			st.regStart = i
@@ -1370,21 +1369,53 @@ func parseRequest(st *stream) bool {
 				return false
 			}
 			st.contentLen = v
+		case "host":
+			if hosts++; hosts > 1 || !validHost(f.Value) {
+				return false
+			}
+			host = f.Value
 		}
 	}
-	if seen&hasMethod == 0 {
+	if seen&hasMethod == 0 || !validToken(st.method) {
 		return false
 	}
-	if string(st.method) == "CONNECT" {
-		return seen&(hasPath|hasScheme) == 0 && seen&hasAuthority != 0
+	if seen&hasAuthority != 0 {
+		if !validHost(st.authority) {
+			return false
+		}
+		// RFC 9113 8.3.1: Host must not name another origin than :authority.
+		if hosts > 0 && !equalFold(host, st.authority) {
+			return false
+		}
 	}
-	return seen&(hasPath|hasScheme) == hasPath|hasScheme && len(st.path) > 0
+	if string(st.method) == "CONNECT" {
+		return seen&(hasPath|hasScheme) == 0 && seen&hasAuthority != 0 && len(st.authority) > 0
+	}
+	return seen&(hasPath|hasScheme) == hasPath|hasScheme && validScheme(st.scheme) && validPath(st.path, st.method)
+}
+
+func equalFold(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 func validTrailers(fields []HeaderField) bool {
 	for i := range fields {
-		n := fields[i].Name
-		if len(n) == 0 || n[0] == ':' || hasUpper(n) {
+		if !validFieldName(fields[i].Name) || !validFieldValue(fields[i].Value) {
 			return false
 		}
 	}

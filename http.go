@@ -1,9 +1,9 @@
 package fasth2
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -22,6 +23,11 @@ import (
 //   - TLS ("h2" via ALPN) is enabled as usual with ListenAndServeTLS / ServeTLS.
 //   - h2c (prior knowledge) is served when hs.Protocols has UnencryptedHTTP2.
 //
+// hs.ReadTimeout, IdleTimeout, WriteTimeout, MaxHeaderBytes and ErrorLog are
+// read when a connection starts and fill the zero fields of s (see Server).
+// TLS connections below TLS 1.2, or TLS 1.2 without an ECDHE AEAD cipher, are
+// refused with INADEQUATE_SECURITY (RFC 9113 9.2).
+//
 // Handlers run on fasth2 worker goroutines (s.Async is forced on), so they
 // may block exactly like under net/http. s may be nil.
 func ConfigureServer(hs *http.Server, s *Server) *Server {
@@ -32,20 +38,35 @@ func ConfigureServer(hs *http.Server, s *Server) *Server {
 	if hs.TLSNextProto == nil {
 		hs.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
 	}
-	hs.TLSNextProto["h2"] = func(_ *http.Server, tc *tls.Conn, h http.Handler) {
+	hs.TLSNextProto["h2"] = func(hs *http.Server, tc *tls.Conn, h http.Handler) {
 		cs := tc.ConnectionState()
-		s.serveConn(tc, connOpts{handler: HTTPHandler(h), ctx: baseContext(h), tls: &cs})
+		if !tlsOK(&cs) {
+			rejectInadequateTLS(tc)
+			return
+		}
+		s.serveConn(tc, connOpts{handler: HTTPHandler(h), ctx: baseContext(h), tls: &cs, hs: hs})
 	}
 	// Go 1.24+ hands h2c connections (preface already consumed) to this key.
-	hs.TLSNextProto["unencrypted_http2"] = func(_ *http.Server, tc *tls.Conn, h http.Handler) {
+	hs.TLSNextProto["unencrypted_http2"] = func(hs *http.Server, tc *tls.Conn, h http.Handler) {
 		nc := tc.NetConn()
 		if u, ok := nc.(interface{ UnencryptedNetConn() net.Conn }); ok {
 			nc = u.UnencryptedNetConn()
 		}
-		s.serveConn(nc, connOpts{handler: HTTPHandler(h), ctx: baseContext(h), sawPreface: true})
+		s.serveConn(nc, connOpts{handler: HTTPHandler(h), ctx: baseContext(h), sawPreface: true, hs: hs})
 	}
 	hs.RegisterOnShutdown(s.Shutdown)
 	return s
+}
+
+// rejectInadequateTLS sends the server preface and GOAWAY INADEQUATE_SECURITY.
+func rejectInadequateTLS(tc *tls.Conn) {
+	b := appendFrameHeader(nil, 0, frSettings, 0, 0)
+	b = appendFrameHeader(b, 8, frGoAway, 0, 0)
+	b = appendU32(b, 0)
+	b = appendU32(b, codeInadequateSec)
+	tc.SetWriteDeadline(time.Now().Add(time.Second))
+	tc.Write(b)
+	tc.Close()
 }
 
 func baseContext(h http.Handler) context.Context {
@@ -153,29 +174,81 @@ func serveHTTP(h http.Handler, req *Request, resp *Response) {
 	if len(cookies) > 0 {
 		hr.Header["Cookie"] = []string{strings.Join(cookies, "; ")}
 	}
-	if hr.Host == "" {
-		hr.Host = hr.Header.Get("Host")
+	// Like net/http: the Host lives in r.Host, not in r.Header. parseRequest
+	// has checked that it matches :authority.
+	if hv, ok := hr.Header["Host"]; ok {
+		if hr.Host == "" && len(hv) > 0 {
+			hr.Host = hv[0]
+		}
+		delete(hr.Header, "Host")
 	}
 	hr.ContentLength = int64(len(req.Body))
+	var body *reqBody
 	if len(req.Body) == 0 {
 		hr.Body = http.NoBody
 	} else {
-		hr.Body = io.NopCloser(bytes.NewReader(req.Body))
+		body = &reqBody{b: req.Body}
+		hr.Body = body
 	}
 	if ctx := req.Context(); ctx != context.Background() {
 		hr = hr.WithContext(ctx)
 	}
 
-	rw := responseWriter{resp: resp, header: make(http.Header), head: method == "HEAD"}
-	h.ServeHTTP(&rw, hr)
+	rw := &responseWriter{resp: resp, header: make(http.Header), head: method == "HEAD"}
+	h.ServeHTTP(rw, hr)
+	// req.Body and resp are stream buffers that the next request on this
+	// connection reuses. Detach them before returning, so a goroutine that
+	// outlives the handler (http.TimeoutHandler does that) gets an error
+	// instead of another request's body or another response.
+	if body != nil {
+		body.finish()
+	}
 	rw.finish()
 }
 
+// reqBody reads a request body that aliases a reusable stream buffer.
+type reqBody struct {
+	mu     sync.Mutex
+	b      []byte
+	closed bool
+}
+
+func (r *reqBody) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	if len(r.b) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b)
+	r.b = r.b[n:]
+	return n, nil
+}
+
+func (r *reqBody) Close() error {
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *reqBody) finish() {
+	r.mu.Lock()
+	r.closed, r.b = true, nil
+	r.mu.Unlock()
+}
+
+var errWriteAfterHandler = errors.New("fasth2: Write after the handler returned")
+
 type responseWriter struct {
+	mu      sync.Mutex
 	resp    *Response
 	header  http.Header
 	status  int
 	wrote   bool
+	done    bool // handler returned; resp belongs to the stream again
 	head    bool
 	hasType bool
 	hasDate bool
@@ -189,13 +262,15 @@ func bodyAllowed(code int) bool {
 	return code != 204 && code != 304 && (code < 100 || code > 199)
 }
 
-func validValue(v string) bool {
-	return strings.IndexByte(v, '\r') < 0 && strings.IndexByte(v, '\n') < 0 && strings.IndexByte(v, 0) < 0
-}
-
 // WriteHeader snapshots the header map, like net/http does.
 func (w *responseWriter) WriteHeader(code int) {
-	if w.wrote || code < 200 || code > 999 { // 1xx informational responses are not supported
+	w.mu.Lock()
+	w.writeHeaderLocked(code)
+	w.mu.Unlock()
+}
+
+func (w *responseWriter) writeHeaderLocked(code int) {
+	if w.done || w.wrote || code < 200 || code > 999 { // 1xx informational responses are not supported
 		return
 	}
 	w.wrote = true
@@ -204,6 +279,9 @@ func (w *responseWriter) WriteHeader(code int) {
 	w.resp.SetStatus(code)
 	for k, vs := range w.header {
 		lk := lowerKey(k)
+		if !validFieldName(lk) { // also drops pseudo-header names (":...")
+			continue
+		}
 		switch lk {
 		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "trailer":
 			continue
@@ -219,11 +297,8 @@ func (w *responseWriter) WriteHeader(code int) {
 		case "date":
 			w.hasDate = true
 		}
-		if strings.HasPrefix(lk, "trailer:") {
-			continue
-		}
 		for _, v := range vs {
-			if validValue(v) {
+			if validFieldValue(v) {
 				w.resp.AddHeader(lk, v)
 			}
 		}
@@ -231,8 +306,17 @@ func (w *responseWriter) WriteHeader(code int) {
 }
 
 func (w *responseWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeLocked(p)
+}
+
+func (w *responseWriter) writeLocked(p []byte) (int, error) {
+	if w.done {
+		return 0, errWriteAfterHandler
+	}
 	if !w.wrote {
-		w.WriteHeader(200)
+		w.writeHeaderLocked(200)
 	}
 	if !bodyAllowed(w.status) {
 		return 0, http.ErrBodyNotAllowed
@@ -249,22 +333,27 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 }
 
 func (w *responseWriter) WriteString(s string) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.head || w.done {
+		return w.writeLocked([]byte(s))
+	}
 	if !w.wrote {
-		w.WriteHeader(200)
+		w.writeHeaderLocked(200)
 	}
 	if !bodyAllowed(w.status) {
 		return 0, http.ErrBodyNotAllowed
-	}
-	if w.head {
-		return w.Write([]byte(s))
 	}
 	return w.resp.WriteString(s)
 }
 
 func (w *responseWriter) finish() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.wrote {
-		w.WriteHeader(200)
+		w.writeHeaderLocked(200)
 	}
+	w.done = true
 	body := w.resp.body
 	if !w.hasType && len(body) > 0 && bodyAllowed(w.status) {
 		n := len(body)
