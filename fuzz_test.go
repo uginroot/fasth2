@@ -23,7 +23,7 @@ func FuzzHPACKDecode(f *testing.F) {
 		for i := 0; i < 2; i++ { // decoder is stateful: decode twice
 			var arena []byte
 			var fields []HeaderField
-			_ = d.decode(data, &arena, &fields)
+			_, _ = d.decode(data, &arena, &fields, 1<<30)
 			if d.size > d.maxSize || d.maxSize > d.allowed {
 				t.Fatalf("table invariant broken: size=%d max=%d allowed=%d", d.size, d.maxSize, d.allowed)
 			}

@@ -29,7 +29,7 @@ func runVectors(t *testing.T, blocks []string, want [][]hf, sizes []int) {
 		}
 		var arena []byte
 		var fields []HeaderField
-		if err := d.decode(raw, &arena, &fields); err != nil {
+		if _, err := d.decode(raw, &arena, &fields, 1<<30); err != nil {
 			t.Fatalf("block %d: %v", i, err)
 		}
 		if len(fields) != len(want[i]) {

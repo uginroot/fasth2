@@ -7,10 +7,7 @@ type HeaderField struct {
 	Name, Value []byte
 }
 
-var (
-	errCompression = errors.New("hpack: compression error")
-	errTooMany     = errors.New("hpack: too many header fields")
-)
+var errCompression = errors.New("hpack: compression error")
 
 const maxHeaderFields = 1024
 
@@ -155,33 +152,44 @@ func (d *hpackDecoder) readString(p []byte, arena *[]byte) ([]byte, []byte, erro
 
 // decode decodes a complete header block, appending fields. Strings are
 // copied into arena or point at immutable table entries.
-func (d *hpackDecoder) decode(p []byte, arena *[]byte, fields *[]HeaderField) error {
+//
+// When the decoded header list exceeds maxList bytes (name+value+32 per
+// field, RFC 9113 6.5.2) or maxHeaderFields fields, decode keeps decoding
+// (the dynamic table must stay in sync with the peer) but stops collecting
+// fields and reports tooLarge. An indexed field costs one byte on the wire
+// but may expand to a 4 KB table entry, so the limit is on the decoded size.
+func (d *hpackDecoder) decode(p []byte, arena *[]byte, fields *[]HeaderField, maxList int) (tooLarge bool, err error) {
 	sawField := false
+	size := 0
 	for len(p) > 0 {
-		if len(*fields) >= maxHeaderFields {
-			return errTooMany
-		}
 		b := p[0]
 		switch {
 		case b&0x80 != 0: // indexed
 			idx, rest, err := readInt(p, 7)
 			if err != nil {
-				return err
+				return tooLarge, err
 			}
 			p = rest
 			n, v, ok := d.at(idx)
 			if !ok {
-				return errCompression
+				return tooLarge, errCompression
 			}
-			*fields = append(*fields, HeaderField{n, v})
 			sawField = true
+			if !tooLarge {
+				size += len(n) + len(v) + 32
+				if size > maxList || len(*fields) >= maxHeaderFields {
+					tooLarge = true
+				} else {
+					*fields = append(*fields, HeaderField{n, v})
+				}
+			}
 		case b&0xe0 == 0x20: // dynamic table size update
 			if sawField {
-				return errCompression
+				return tooLarge, errCompression
 			}
 			sz, rest, err := readInt(p, 5)
 			if err != nil || sz > uint64(d.allowed) {
-				return errCompression
+				return tooLarge, errCompression
 			}
 			p = rest
 			d.maxSize = int(sz)
@@ -193,32 +201,43 @@ func (d *hpackDecoder) decode(p []byte, arena *[]byte, fields *[]HeaderField) er
 			}
 			idx, rest, err := readInt(p, prefix)
 			if err != nil {
-				return err
+				return tooLarge, err
 			}
 			p = rest
+			mark := len(*arena)
 			var name []byte
 			if idx == 0 {
 				if name, p, err = d.readString(p, arena); err != nil {
-					return err
+					return tooLarge, err
 				}
 			} else {
 				var ok bool
 				if name, _, ok = d.at(idx); !ok {
-					return errCompression
+					return tooLarge, errCompression
 				}
 			}
 			var value []byte
 			if value, p, err = d.readString(p, arena); err != nil {
-				return err
+				return tooLarge, err
 			}
 			if index {
-				d.add(name, value)
+				d.add(name, value) // copies
 			}
-			*fields = append(*fields, HeaderField{name, value})
 			sawField = true
+			if !tooLarge {
+				size += len(name) + len(value) + 32
+				if size > maxList || len(*fields) >= maxHeaderFields {
+					tooLarge = true
+				}
+			}
+			if tooLarge {
+				*arena = (*arena)[:mark] // field is dropped: do not keep its bytes
+			} else {
+				*fields = append(*fields, HeaderField{name, value})
+			}
 		}
 	}
-	return nil
+	return tooLarge, nil
 }
 
 // ---- encoder helpers (stateless: never inserts into the peer's dynamic table) ----
