@@ -84,6 +84,7 @@ Every push runs in CI:
 | compatibility | `net/http` drop-in: gorilla/mux, `http.ServeMux`, context cancellation, `Shutdown`, large bodies |
 | fuzzing | `go test -fuzz` on the HPACK decoder, Huffman codec and whole connections (arbitrary frames after a valid preface), inline and async; panics and hangs fail the run |
 | race detector | all tests run with `-race` on Go 1.24 and the latest Go |
+| security | `security_test.go`: Rapid Reset, non-reading client, header-list amplification, SETTINGS flood, blocked writer + connection error, handler panics, slot leak, buffer reuse after the handler returns, field validation, all timeouts, body budget, TLS policy |
 
 Locally:
 
@@ -95,13 +96,40 @@ go test -run '^$' -fuzz '^FuzzConnAsync$' -fuzztime 5m .
 go build ./cmd/fasth2server && ./fasth2server -addr :8085 & h2spec -h 127.0.0.1 -p 8085
 ```
 
+## Limits and timeouts
+
+Every connection is bounded. Zero means the default, a negative timeout disables it.
+With `ConfigureServer`, a zero field takes the `http.Server` value (read when a
+connection starts).
+
+| `Server` field | default | from `http.Server` | what it bounds |
+|---|---|---|---|
+| `MaxConcurrentStreams` | 250 | — | open streams, **including streams reset by the client while their handler still runs** (Rapid Reset, CVE-2023-44487) |
+| `MaxRequestBodySize` | 16 MiB | — | one request body |
+| `MaxConnBodySize` | 64 MiB | — | request bodies buffered on one connection; a stream over it gets `REFUSED_STREAM` |
+| `MaxHeaderListSize` | 1 MiB | `MaxHeaderBytes` | decoded header list (name+value+32 per field); larger requests get 431 |
+| `HandshakeTimeout` | 10s | — | client preface + first SETTINGS |
+| `ReadTimeout` | 60s | `ReadTimeout` | HEADERS → END_STREAM of a request, and an unfinished header block |
+| `IdleTimeout` | 120s | `IdleTimeout` (else `ReadTimeout`) | connection without open streams (then GOAWAY) |
+| `WriteByteTimeout` | 30s | `WriteTimeout` | one 64 KiB write chunk; waiting for flow-control credit |
+| `ErrorLog` | `log` | `ErrorLog` | where handler panics are logged |
+
+Also: a client that does not read stops being read (at most 256 KiB of output is queued
+behind a blocked write); at most 100 SETTINGS frames with `INITIAL_WINDOW_SIZE` per 10 s;
+requests with invalid field names or values (CR, LF, NUL, other controls), invalid
+`:method`, `:scheme`, `:path`, `:authority`/`Host`, or `Host` ≠ `:authority` are reset with
+`PROTOCOL_ERROR`; TLS below 1.2, or TLS 1.2 without an ECDHE AEAD suite, gets
+`INADEQUATE_SECURITY` (RFC 9113 §9.2).
+
+Handlers are not time-limited (as in `net/http`). A handler that keeps running after
+its stream was reset still holds a slot until it returns, so watch `r.Context()`.
+
 ## Limitations
 
 - Drop-in adapter: no `http.Flusher` (SSE/streaming), `Hijacker`, 1xx responses or
-  trailers (so not for gRPC); request and response bodies are fully buffered
-  (request body limit 16 MiB by default).
-- `net/http` `ReadTimeout`/`WriteTimeout`/`IdleTimeout` are **not** applied to HTTP/2
-  connections yet — add a proxy or timeouts before exposing to the internet.
+  trailers (so not for gRPC); request and response bodies are fully buffered.
+  `r.Body` and the `ResponseWriter` stop working when the handler returns
+  (reads/writes from a leftover goroutine get an error).
 - Response headers are HPACK-encoded without the dynamic table (slightly larger headers).
 - Stream priorities are ignored; no server push.
 - Native inline handlers must not block.
@@ -114,7 +142,9 @@ go build ./cmd/fasth2server && ./fasth2server -addr :8085 & h2spec -h 127.0.0.1 
 в существующем `net/http`-сервисе одной строкой `fasth2.ConfigureServer(srv, nil)`.
 В тестах на gorilla/mux-приложении — ускорение ×2–3; нативный API быстрее
 `net/http` в 10–20 раз. Статус — экспериментальный: перед продом прогоните на
-стейдже и учтите ограничения выше (нет стриминга ответов, таймаутов HTTP/2-соединений).
+стейдже и учтите ограничения выше (нет стриминга ответов). Лимиты и таймауты
+соединений включены по умолчанию, `ConfigureServer` берёт их из `http.Server`
+(см. «Limits and timeouts»).
 
 ## License
 
