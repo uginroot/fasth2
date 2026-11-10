@@ -680,6 +680,50 @@ func TestSecConnBodyBudget(t *testing.T) {
 	}
 }
 
+type countingConn struct {
+	net.Conn
+	reads atomic.Int64
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(p)
+}
+
+// A deadline that fires while no new one is needed (busy connection, no
+// stream deadlines) must be cleared, or every Read fails at once and the
+// reader spins until the handler returns.
+func TestSecExpiredDeadlineDoesNotSpin(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	s := &Server{Async: true, HandshakeTimeout: 150 * time.Millisecond, Handler: func(_ *Request, resp *Response) {
+		time.Sleep(600 * time.Millisecond) // handshake deadline fires while this runs
+		resp.WriteString("ok")
+	}}
+	cc := make(chan *countingConn, 1)
+	go func() {
+		nc, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		w := &countingConn{Conn: nc}
+		cc <- w
+		s.ServeConn(w)
+	}()
+	c := dialH2(t, ln.Addr().String(), true)
+	c.send(headers(1, true, reqGET))
+	if st := c.awaitStatus(1); st != "200" {
+		t.Fatalf("status %q", st)
+	}
+	if n := (<-cc).reads.Load(); n > 20 {
+		t.Fatalf("%d reads for one request: the reader spun on an expired deadline", n)
+	}
+	s.Shutdown()
+}
+
 func TestSecTLSPolicy(t *testing.T) {
 	cases := []struct {
 		v, cs uint16

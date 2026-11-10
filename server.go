@@ -687,14 +687,6 @@ var errHandshakeTimeout = errors.New("http2: handshake timeout")
 
 func (c *conn) isIdleConn() bool { return len(c.streams) == 0 && c.orphans == 0 && c.hbID == 0 }
 
-// setReadDeadlineLocked sets the read deadline of nc (zero clears it).
-func (c *conn) setReadDeadlineLocked(t time.Time) {
-	if !t.Equal(c.rdl) {
-		c.rdl = t
-		c.nc.SetReadDeadline(t)
-	}
-}
-
 // armLocked makes sure the reader wakes up no later than t. Callable from
 // workers: SetReadDeadline also affects a Read in progress.
 func (c *conn) armLocked(t time.Time) {
@@ -785,7 +777,10 @@ func (c *conn) onReadDeadlineLocked() error {
 		}
 		earliest(c.idleSince.Add(c.idleTO))
 	}
-	c.setReadDeadlineLocked(want)
+	// Always rewrite: the deadline on nc has expired, and leaving it (when
+	// want is zero) would make every following Read fail at once.
+	c.rdl = want
+	c.nc.SetReadDeadline(want)
 	return nil
 }
 

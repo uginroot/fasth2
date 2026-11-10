@@ -123,6 +123,8 @@ requests with invalid field names or values (CR, LF, NUL, other controls), inval
 
 Handlers are not time-limited (as in `net/http`). A handler that keeps running after
 its stream was reset still holds a slot until it returns, so watch `r.Context()`.
+When all slots are taken this way, new streams get `REFUSED_STREAM` (clients retry
+them); `net/http` queues such requests instead.
 
 ## Limitations
 
