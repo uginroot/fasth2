@@ -9,12 +9,18 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// hookPanics — паники соединения, которые увидел panicHook. Сервер за net/http
+// глушит повторную панику в conn.serve (соединение просто закрывается), поэтому
+// FuzzStreams сверяет этот счётчик.
+var hookPanics atomic.Int64
+
 func init() {
-	panicHook = func(r any) { panic(r) } // surface panics in tests
+	panicHook = func(r any) { hookPanics.Add(1); panic(r) } // surface panics in tests
 	// Счётчик потоковых тел, которые ещё приходят, совпадает с потоками.
 	roundHook = func(c *conn) {
 		n := 0

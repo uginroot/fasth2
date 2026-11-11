@@ -94,7 +94,7 @@ Every push runs in CI:
 | interop | curl, nghttp and h2load (h2c and TLS), Go `net/http` client, HTTP/1.1 fallback |
 | compatibility | `net/http` drop-in: gorilla/mux, `http.ServeMux`, context cancellation, `Shutdown`, large bodies |
 | streaming | `stream_test.go`: trailers (frames, flow control), `Flush` (backpressure, timeout, client reset, leftover goroutine), full duplex (ping-pong, early return, reset while reading, read timeout, body budget) |
-| fuzzing | `go test -fuzz` on the HPACK decoder, Huffman codec and whole connections through the `net/http` adapter (arbitrary frames after a valid preface); panics and hangs fail the run |
+| fuzzing | `go test -fuzz` on the HPACK decoder, Huffman codec and whole connections through the `net/http` adapter (arbitrary frames after a valid preface); panics and hangs fail the run. `FuzzStreams` builds client actions (streams, DATA, trailers, RST_STREAM, window and SETTINGS changes, header blocks split across writes with pauses) over real TCP and checks that every response, body and trailer arrives on the stream of its request; a hook checks connection invariants (open streaming bodies, free list) after every read round |
 | race detector | all tests run with `-race` on Go 1.24 and the latest Go |
 | security | `security_test.go`: Rapid Reset, non-reading client, header-list amplification, SETTINGS flood, blocked writer + connection error, handler panics, slot leak, buffer reuse after the handler returns, field validation, all timeouts, body budget, TLS policy |
 
@@ -105,6 +105,7 @@ go test -race ./...
 git clone --depth 1 https://github.com/http2jp/hpack-test-case /tmp/htc
 HPACK_TEST_CASE_DIR=/tmp/htc go test -run HPACKTestCase -v .
 go test -run '^$' -fuzz '^FuzzConn$' -fuzztime 5m .
+go test -run '^$' -fuzz '^FuzzStreams$' -fuzztime 5m .
 go build ./cmd/muxapp && ./muxapp -addr :8086 -fasth2 & h2spec -h 127.0.0.1 -p 8086
 ```
 

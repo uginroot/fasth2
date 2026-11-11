@@ -26,7 +26,8 @@ func TestStreamReleasedDuringHeaderBlock(t *testing.T) {
 	c.send(frame(frHeaders, flEndStream, 1, lit(nil, "x-trailer", "1")))
 	time.Sleep(50 * time.Millisecond)
 	close(release) // поток закончится, пока блок заголовков не закончен
-	time.Sleep(50 * time.Millisecond)
+	// Поток не дописал тело: после ответа сервер сбрасывает его с NO_ERROR.
+	c.await(2*time.Second, "RST_STREAM потока 1 после ответа", func(f tframe) bool { return f.sid == 1 && f.typ == frRSTStream })
 	c.send(frame(frContinuation, flEndHeaders, 1, nil))
 	// Соединение живо, и новый потоковый RPC обслуживается как обычно.
 	c.send(headers(3, true, reqGET))
@@ -36,8 +37,10 @@ func TestStreamReleasedDuringHeaderBlock(t *testing.T) {
 }
 
 // То же для запрещённого HEADERS на полузакрытом потоке (kindRSTClosed): поток
-// закончился, пока блок не закончен. Конец блока не должен ещё раз освобождать
-// структуру (roundHook проверяет c.free).
+// закончился, пока блок не закончен. Конец блока не освобождает структуру ещё
+// раз (раньше одна структура попадала в c.free дважды и доставалась двум
+// потокам) и разбирается как HEADERS на закрытый поток: GOAWAY STREAM_CLOSED,
+// как в onHeaders, независимо от того, успел ли обработчик вернуться.
 func TestHalfClosedStreamReleasedDuringHeaderBlock(t *testing.T) {
 	release := make(chan struct{})
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -46,19 +49,20 @@ func TestHalfClosedStreamReleasedDuringHeaderBlock(t *testing.T) {
 	})
 	addr, _ := startMux(t, &http.Server{Handler: h}, nil)
 	c := dialH2(t, addr, true)
+	panics := hookPanics.Load()
 	c.send(headers(1, true, reqGET)) // запрос целиком, обработчик ждёт
 	time.Sleep(50 * time.Millisecond)
 	c.send(frame(frHeaders, 0, 1, lit(nil, "x-again", "1"))) // HEADERS на полузакрытом потоке, без END_HEADERS
 	time.Sleep(50 * time.Millisecond)
 	close(release)
-	time.Sleep(50 * time.Millisecond)
+	c.await(2*time.Second, "конец ответа потока 1", func(f tframe) bool {
+		return f.sid == 1 && f.typ == frData && f.flags&flEndStream != 0
+	})
 	c.send(frame(frContinuation, flEndHeaders, 1, nil))
-	for _, sid := range []uint32{3, 5} {
-		c.send(headers(sid, true, reqGET))
+	if code := c.awaitGoAway(); code != codeStreamClosed {
+		t.Fatalf("GOAWAY с кодом %d, ждали STREAM_CLOSED", code)
 	}
-	for _, sid := range []uint32{3, 5} {
-		if s := c.awaitStatus(sid); s != "200" {
-			t.Fatalf("поток %d: статус %s", sid, s)
-		}
+	if n := hookPanics.Load() - panics; n > 0 {
+		t.Fatalf("паник на сервере: %d", n)
 	}
 }
