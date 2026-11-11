@@ -686,8 +686,8 @@ func TestSecConnBodyBudget(t *testing.T) {
 	testConnBodyBudget(t, http.HandlerFunc(okHandler), "content-length", "409600")
 }
 
-// Потоковый RPC без content-length: тело ограничивает окно соединения
-// (MaxConnBodySize), а не сброс по бюджету. Окно соединения за непрочитанные
+// Потоковый RPC без content-length: тело ограничивает окно соединения (не
+// больше MaxConnBodySize), а не сброс по бюджету. Окно соединения за непрочитанные
 // байты не возвращается, пока обработчики не прочтут их; клиент, который
 // соблюдает окна, ждёт и не получает сброс.
 func TestSecConnBodyBudgetStreaming(t *testing.T) {

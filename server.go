@@ -390,6 +390,10 @@ const (
 	kindRSTClosed
 	kindRefuse
 	kindIgnore
+	// kindReleased: поток закончился посреди своего блока заголовков (release).
+	// Конец блока декодируется для HPACK и разбирается как кадр закрытого
+	// потока: по записи в кольце (см. finishHeaders).
+	kindReleased
 )
 
 type conn struct {
@@ -493,7 +497,8 @@ type conn struct {
 	// min(ourInitWindow, maxBody), но не меньше 65535 (до нашего SETTINGS клиент
 	// вправе послать столько). Непрочитанное потоковое тело не больше него.
 	initWindow int
-	// connWindow — окно приёма соединения: 65535+ourConnWindow, как в x/net.
+	// connWindow — окно приёма соединения: 65535+ourConnWindow, как в x/net (не
+	// больше MaxConnBodySize и не меньше 65535).
 	// Буферизованные тела возвращают окно при получении, потоковые — когда
 	// обработчик читает (creditReadLocked): так непрочитанное потоковое тело всех
 	// потоков вместе не больше окна, и клиент ждёт, а не получает сброс. Окно не
@@ -569,7 +574,10 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 		c.maxConnBody = defaultMaxConnBody
 	}
 	c.initWindow = min(ourInitWindow, max(c.maxBody, 65535))
-	c.connWindow = 65535 + ourConnWindow
+	// Не больше бюджета соединения: иначе непрочитанное потоковое тело в
+	// пределах окон превысило бы MaxConnBodySize, и поток честного клиента
+	// сбрасывался бы. Не меньше 65535 (начальное окно протокола).
+	c.connWindow = min(65535+ourConnWindow, max(c.maxConnBody, 65535))
 	c.recvWindow = int64(c.connWindow)
 	var hsRead, hsIdle, hsWrite time.Duration
 	if hs := o.hs; hs != nil {
@@ -1054,7 +1062,9 @@ func (c *conn) writeServerPreface() {
 	c.wbuf = appendU32(c.wbuf, uint32(c.initWindow))
 	c.wbuf = append(c.wbuf, 0, 6) // MAX_HEADER_LIST_SIZE
 	c.wbuf = appendU32(c.wbuf, uint32(c.maxHeaderList))
-	c.writeWindowUpdate(0, uint32(c.connWindow-65535))
+	if c.connWindow > 65535 {
+		c.writeWindowUpdate(0, uint32(c.connWindow-65535)) // приращение 0 — ошибка протокола
+	}
 }
 
 func (c *conn) writeRST(sid, code uint32) {
@@ -1212,10 +1222,10 @@ func (c *conn) release(st *stream) {
 	}
 	if c.hbStream == st {
 		// Блок заголовков этого потока ещё не закончен (обработчик вернулся
-		// между HEADERS и CONTINUATION): конец блока только декодируется для
-		// таблицы HPACK. Иначе finishHeaders работал бы с освобождённой
-		// структурой (второй recycle, второй halfCloseLocked).
-		c.hbStream, c.hbKind = nil, kindIgnore
+		// между HEADERS и CONTINUATION): finishHeaders не должен трогать
+		// освобождённую структуру (второй recycle, второй halfCloseLocked).
+		// Каждый вызов release уже записал поток в кольцо (ringPush).
+		c.hbStream, c.hbKind = nil, kindReleased
 	}
 	if st.inHandler {
 		// The worker still uses it and drops the stream when done. Until
@@ -1415,6 +1425,13 @@ func (c *conn) finishHeaders(sid uint32, st *stream, kind int, endStream, selfDe
 	}
 	switch kind {
 	case kindIgnore:
+		return nil
+	case kindReleased:
+		// Как HEADERS на закрытый поток в onHeaders: после нашего RST_STREAM —
+		// игнорировать, после обычного конца потока — STREAM_CLOSED.
+		if e, found := c.ringLookup(sid); found && !e.reset {
+			return connError(codeStreamClosed)
+		}
 		return nil
 	case kindRefuse:
 		c.writeRST(sid, codeRefusedStream)

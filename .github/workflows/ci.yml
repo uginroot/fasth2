@@ -3,9 +3,12 @@ on: [push, pull_request]
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # arm64 — как Graviton в проде (бесплатный раннер для открытых репозиториев).
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
         go: ['1.24.x', 'stable']
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +21,8 @@ jobs:
       - run: go test -race -count=1 -v -run 'HPACKTestCase' ./...
         env:
           HPACK_TEST_CASE_DIR: /tmp/hpack-test-case
-      - run: go test -race -count=1 ./...
+      # На arm64 (слабее упорядочивание памяти) набор гоняется трижды.
+      - run: go test -race -count=${{ matrix.os == 'ubuntu-24.04-arm' && 3 || 1 }} ./...
 
   conformance:
     runs-on: ubuntu-latest
@@ -59,7 +63,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [FuzzHPACKDecode, FuzzHuffmanDecode, FuzzHuffmanRoundTrip, FuzzConn]
+        target: [FuzzHPACKDecode, FuzzHuffmanDecode, FuzzHuffmanRoundTrip, FuzzConn, FuzzStreams]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -71,4 +75,24 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-${{ matrix.target }}
+          path: testdata/fuzz
+
+  # Соединения на arm64: другое упорядочивание памяти и планирование потоков.
+  fuzz-arm64:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzConn, FuzzStreams]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 90s .
+      - name: Upload failing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-arm64-${{ matrix.target }}
           path: testdata/fuzz
