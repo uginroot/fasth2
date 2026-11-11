@@ -11,16 +11,15 @@ import (
 	"time"
 )
 
-// Окно соединения, которое сервер объявляет в преамбуле: не меньше
-// MaxConnBodySize (по умолчанию 64 МиБ) и не больше 2^31-1.
-func TestConnWindowFromConnBodyLimit(t *testing.T) {
+// Окно соединения, которое сервер объявляет в преамбуле: 65535 + 1 МиБ, как в
+// x/net, и не зависит от MaxConnBodySize (см. conn.connWindow).
+func TestConnWindowLikeXNet(t *testing.T) {
 	cases := []struct {
 		name string
 		s    *Server
-		want uint32
 	}{
-		{"по умолчанию", nil, defaultMaxConnBody - 65535},
-		{"больше 2^31-1", &Server{MaxConnBodySize: int(^uint(0) >> 1)}, maxWindow - 65535},
+		{"по умолчанию", nil},
+		{"большой MaxConnBodySize", &Server{MaxConnBodySize: 1 << 30}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -29,8 +28,8 @@ func TestConnWindowFromConnBodyLimit(t *testing.T) {
 			f := c.await(3*time.Second, "WINDOW_UPDATE соединения", func(f tframe) bool {
 				return f.sid == 0 && f.typ == frWindowUpdate
 			})
-			if got := binary.BigEndian.Uint32(f.p) & 0x7fffffff; got != tc.want {
-				t.Fatalf("приращение окна соединения %d, ждали %d", got, tc.want)
+			if got := binary.BigEndian.Uint32(f.p) & 0x7fffffff; got != ourConnWindow {
+				t.Fatalf("приращение окна соединения %d, ждали %d", got, ourConnWindow)
 			}
 		})
 	}

@@ -61,7 +61,9 @@ cancellation):
   body does not arrive within one read, and `r.Body` returns data as it arrives.
   The stream's flow-control window is given back as the handler reads, so a fast
   client waits for a slow handler instead of being reset, and at most one window
-  (1 MiB, or less with a smaller `MaxRequestBodySize`) of unread body is held per stream. Other requests are buffered whole
+  (1 MiB, or less with a smaller `MaxRequestBodySize`) of unread body is held per stream,
+  and at most the connection window (1 MiB + 64 KiB, as in `x/net`) per connection: as with
+  `x/net`, a handler that does not read holds back request bodies of the other streams. Other requests are buffered whole
   before the handler runs, as before.
 
 ## Benchmarks
@@ -116,7 +118,7 @@ connection starts).
 |---|---|---|---|
 | `MaxConcurrentStreams` | 250 | — | open streams, **including streams reset by the client while their handler still runs** (Rapid Reset, CVE-2023-44487) |
 | `MaxRequestBodySize` | 16 MiB | — | one request body buffered before the handler runs. Also caps the stream receive window we advertise (`min(1 MiB, MaxRequestBodySize)`, not below 64 KiB), so a streaming RPC holds at most that much unread; its total over the stream's life is not limited, as in `net/http` and gRPC (limit message size in the RPC layer, e.g. connect-go `WithReadMaxBytes`) |
-| `MaxConnBodySize` | 64 MiB | — | request body bytes buffered on one connection and not yet read by handlers; a stream over it gets `REFUSED_STREAM` (`ENHANCE_YOUR_CALM` if its handler already runs: `REFUSED_STREAM` would invite a retry). Also the connection receive window we advertise (at least 1 MiB + 64 KiB, at most 2^31-1), so unread streaming bodies of all streams together hold at most that much |
+| `MaxConnBodySize` | 64 MiB | — | request body bytes buffered on one connection and not yet read by handlers; a stream over it gets `REFUSED_STREAM` (`ENHANCE_YOUR_CALM` if its handler already runs: `REFUSED_STREAM` would invite a retry). |
 | `MaxHeaderListSize` | 1 MiB | `MaxHeaderBytes` | decoded header list (name+value+32 per field); larger requests get 431 |
 | `HandshakeTimeout` | 10s | — | client preface + first SETTINGS |
 | `ReadTimeout` | 60s | `ReadTimeout` | HEADERS → END_STREAM of a request, and an unfinished header block. A streaming RPC whose handler already runs is bound only by an explicitly set value (here or in `http.Server`): the 60s default does not cut long bidi streams, as in `net/http` |
