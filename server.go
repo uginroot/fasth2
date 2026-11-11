@@ -59,7 +59,7 @@ const (
 	clientPreface  = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 	maxFrameSize   = 16384
 	ourInitWindow  = 1 << 20
-	ourConnWindow  = 1 << 20 // минимум окна соединения сверх 65535 по умолчанию (см. conn.connWindow)
+	ourConnWindow  = 1 << 20 // окно соединения сверх 65535 (см. conn.connWindow)
 	maxWindow      = 1<<31 - 1
 	maxHeaderBlock = 1 << 18
 	readBufSize    = 1 << 16
@@ -406,7 +406,8 @@ type conn struct {
 	// recvStreaming — потоки, тело которых ещё приходит, а обработчик уже
 	// работает (dispatchEarly, до END_STREAM). Пока они есть, serveRaw читает
 	// ещё раз: обработчик ждёт в Read без срока, и FIN, пропущенный в одном
-	// сегменте с последним DATA, держал бы соединение. Под c.mu.
+	// сегменте с последним DATA, держал бы соединение. Цена — read с EAGAIN на
+	// каждый раунд такого соединения, как у net.Conn.Read. Под c.mu.
 	recvStreaming int
 
 	// mu guards all connection state below except the read buffer, which is
@@ -492,11 +493,14 @@ type conn struct {
 	// min(ourInitWindow, maxBody), но не меньше 65535 (до нашего SETTINGS клиент
 	// вправе послать столько). Непрочитанное потоковое тело не больше него.
 	initWindow int
-	// connWindow — окно приёма соединения: не меньше 65535+ourConnWindow и не
-	// меньше MaxConnBodySize. Буферизованные тела возвращают окно при получении,
-	// потоковые — когда обработчик читает (creditReadLocked): так непрочитанное
-	// потоковое тело всех потоков ограничено окном соединения, и клиент ждёт,
-	// а не получает сброс.
+	// connWindow — окно приёма соединения: 65535+ourConnWindow, как в x/net.
+	// Буферизованные тела возвращают окно при получении, потоковые — когда
+	// обработчик читает (creditReadLocked): так непрочитанное потоковое тело всех
+	// потоков вместе не больше окна, и клиент ждёт, а не получает сброс. Окно не
+	// растёт с MaxConnBodySize: иначе непрочитанное потоковое тело занимало бы
+	// весь бюджет соединения, и буферизованные тела рядом с ним сбрасывались бы.
+	// Цена, как в x/net: медленный потоковый обработчик задерживает тела
+	// остальных потоков соединения.
 	connWindow int
 
 	// header block being assembled (HEADERS + CONTINUATION)
@@ -565,10 +569,7 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 		c.maxConnBody = defaultMaxConnBody
 	}
 	c.initWindow = min(ourInitWindow, max(c.maxBody, 65535))
-	// После значения по умолчанию для maxConnBody: иначе окно соединения было бы
-	// 65535+ourConnWindow, и один медленный потоковый обработчик останавливал бы
-	// приём тел всего соединения. Не больше maxWindow (RFC 9113 6.9.1).
-	c.connWindow = min(max(c.maxConnBody, 65535+ourConnWindow), maxWindow)
+	c.connWindow = 65535 + ourConnWindow
 	c.recvWindow = int64(c.connWindow)
 	var hsRead, hsIdle, hsWrite time.Duration
 	if hs := o.hs; hs != nil {
@@ -1209,6 +1210,13 @@ func (c *conn) release(st *stream) {
 	if st.streaming && !st.halfClosed {
 		c.recvStreaming-- // тело больше не придёт
 	}
+	if c.hbStream == st {
+		// Блок заголовков этого потока ещё не закончен (обработчик вернулся
+		// между HEADERS и CONTINUATION): конец блока только декодируется для
+		// таблицы HPACK. Иначе finishHeaders работал бы с освобождённой
+		// структурой (второй recycle, второй halfCloseLocked).
+		c.hbStream, c.hbKind = nil, kindIgnore
+	}
 	if st.inHandler {
 		// The worker still uses it and drops the stream when done. Until
 		// then it counts toward maxConc, so RST_STREAM cannot be used to run
@@ -1447,7 +1455,7 @@ func (c *conn) finishHeaders(sid uint32, st *stream, kind int, endStream, selfDe
 	}
 	st.gotHeaders = true
 	if endStream {
-		st.halfClosed = true
+		c.halfCloseLocked(st)
 		if st.contentLen > 0 {
 			c.resetStream(st, codeProtocol)
 			return nil
@@ -2075,16 +2083,32 @@ func (c *conn) writeResponse(st *stream, resp *response) {
 	if hasTrailers {
 		st.trailers = resp.trailers // resp принадлежит потоку до recycle
 	}
-	rem, ended := c.sendData(st.id, &st.sendWindow, resp.body, !hasTrailers)
-	if len(rem) == 0 {
-		if !ended {
-			c.writeHeaderFrames(st.id, c.headerBlock(0, st.trailers, -1), true)
-		}
-		c.endStream(st)
+	c.sendBodyLocked(st, resp.body)
+}
+
+// sendBodyLocked отправляет тело ответа потока, очередь которого (st.out)
+// пуста, сколько позволяют окна, без копии в st.out; остаток ждёт в st.out
+// (см. flushPending). Когда ответ готов целиком (respDone) и всё ушло,
+// завершает его (endResponseLocked).
+func (c *conn) sendBodyLocked(st *stream, body []byte) {
+	rem, ended := c.sendData(st.id, &st.sendWindow, body, st.respDone && len(st.trailers) == 0)
+	if len(rem) > 0 {
+		st.out = append(st.out[:0], rem...)
+		c.pend(st) // срок продвижения пустой очереди не взведён, его взводит pend
 		return
 	}
-	st.out = append(st.out[:0], rem...)
-	c.pend(st)
+	if st.respDone {
+		c.endResponseLocked(st, ended)
+	}
+}
+
+// endResponseLocked завершает ответ, тело которого ушло целиком: трейлеры
+// (если END_STREAM не ушёл с последним DATA) и endStream.
+func (c *conn) endResponseLocked(st *stream, ended bool) {
+	if !ended {
+		c.writeHeaderFrames(st.id, c.headerBlock(0, st.trailers, -1), true)
+	}
+	c.endStream(st)
 }
 
 // headerBlock кодирует блок заголовков ответа динамической таблицей HPACK
@@ -2188,26 +2212,12 @@ func (c *conn) queueResponseLocked(st *stream, resp *response, final bool) {
 	body := resp.body
 	resp.body = resp.body[:0] // обработчик снова пишет только после возврата отсюда
 	if len(st.out) == 0 {
-		// Очередь пуста: тело — сразу в буфер записи, в st.out — только остаток,
-		// который не пустили окна (как writeResponse). Срок продвижения пустой
-		// очереди не взведён, его взводит pend.
-		end := st.respDone && len(st.trailers) == 0
-		rem, ended := c.sendData(st.id, &st.sendWindow, body, end)
-		if len(rem) == 0 {
-			if st.respDone {
-				if !ended {
-					c.writeHeaderFrames(st.id, c.headerBlock(0, st.trailers, -1), true)
-				}
-				c.endStream(st)
-			}
-			return
-		}
-		st.out = append(st.out, rem...)
-	} else {
-		st.out = append(st.out, body...)
-		if c.sendOut(st) {
-			return // поток закрыт
-		}
+		c.sendBodyLocked(st, body) // очередь пуста: тело сразу в буфер записи
+		return
+	}
+	st.out = append(st.out, body...)
+	if c.sendOut(st) {
+		return // поток закрыт
 	}
 	if len(st.out) > 0 {
 		c.pend(st)
@@ -2252,10 +2262,7 @@ func (c *conn) sendOut(st *stream) bool {
 	if !st.respDone {
 		return false
 	}
-	if !ended {
-		c.writeHeaderFrames(st.id, c.headerBlock(0, st.trailers, -1), true)
-	}
-	c.endStream(st)
+	c.endResponseLocked(st, ended)
 	return true
 }
 

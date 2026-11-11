@@ -26,6 +26,19 @@ func init() {
 		if n != c.recvStreaming {
 			panic(fmt.Sprintf("recvStreaming %d, потоков с телом в пути %d", c.recvStreaming, n))
 		}
+		// Структура потока лежит в c.free не больше одного раза и не живая.
+		seen := make(map[*stream]bool, len(c.free))
+		for _, st := range c.free {
+			if seen[st] {
+				panic(fmt.Sprintf("поток %d дважды в c.free", st.id))
+			}
+			seen[st] = true
+		}
+		for _, st := range c.streams {
+			if seen[st] {
+				panic(fmt.Sprintf("поток %d и в c.streams, и в c.free", st.id))
+			}
+		}
 	}
 }
 
