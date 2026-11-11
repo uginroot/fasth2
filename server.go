@@ -200,7 +200,9 @@ type Server struct {
 	HandshakeTimeout time.Duration
 	// ReadTimeout limits the time from a request's HEADERS to its END_STREAM
 	// (and of an unfinished header block). The stream is reset with CANCEL.
-	// Default 60s, or http.Server.ReadTimeout.
+	// Default 60s, or http.Server.ReadTimeout. Streaming RPCs (gRPC and Connect
+	// client and bidi streams, whose handler runs before END_STREAM) get only an
+	// explicitly set value: the default does not limit them, like net/http.
 	ReadTimeout time.Duration
 	// IdleTimeout closes a connection with GOAWAY after this long without
 	// open streams. Default 120s, or http.Server.IdleTimeout (ReadTimeout
@@ -394,9 +396,18 @@ type conn struct {
 	srv *Server
 	nc  net.Conn
 	raw syscall.RawConn // h2c: читатель работает в serveRaw (запись и чтение под c.mu)
-	// idleAfterRound: после последнего раунда открытых потоков нет — serveRaw
-	// читает ещё раз, чтобы не пропустить EOF. Пишет и читает только читатель.
-	idleAfterRound bool
+	// readAgain: после последнего раунда открытых потоков нет или клиент прислал
+	// GOAWAY — serveRaw читает ещё раз, чтобы не пропустить EOF. Пишет и читает
+	// только читатель.
+	readAgain bool
+	// peerGoAway: клиент прислал GOAWAY (новых потоков не будет, скоро FIN).
+	// Пишет и читает только читатель.
+	peerGoAway bool
+	// recvStreaming — потоки, тело которых ещё приходит, а обработчик уже
+	// работает (dispatchEarly, до END_STREAM). Пока они есть, serveRaw читает
+	// ещё раз: обработчик ждёт в Read без срока, и FIN, пропущенный в одном
+	// сегменте с последним DATA, держал бы соединение. Под c.mu.
+	recvStreaming int
 
 	// mu guards all connection state below except the read buffer, which is
 	// owned by the reader goroutine.
@@ -412,9 +423,13 @@ type conn struct {
 	maxHeaderList int
 	maxConnBody   int
 	readTO        time.Duration
-	idleTO        time.Duration
-	writeTO       time.Duration
-	errorLog      *log.Logger
+	// streamReadTO — ReadTimeout для потоковых RPC (dispatchEarly): только
+	// заданный явно (Server или http.Server), без значения по умолчанию. Долгий
+	// bidi — обычный режим gRPC, и net/http по умолчанию его не ограничивает.
+	streamReadTO time.Duration
+	idleTO       time.Duration
+	writeTO      time.Duration
+	errorLog     *log.Logger
 
 	orphans int // streams released while their handler still runs
 	// inflight — обработчики этого соединения, которые запущены и не вернулись.
@@ -532,7 +547,6 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 		peerInitWindow: 65535,
 		peerMaxFrame:   maxFrameSize,
 		sendWindow:     65535,
-		recvWindow:     65535 + ourConnWindow,
 		maxConc:        int(s.MaxConcurrentStreams),
 		maxBody:        s.MaxRequestBodySize,
 		maxConnBody:    s.MaxConnBodySize,
@@ -547,12 +561,15 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 	if c.maxBody <= 0 {
 		c.maxBody = defaultMaxBody
 	}
-	c.initWindow = min(ourInitWindow, max(c.maxBody, 65535))
-	c.connWindow = max(c.maxConnBody, 65535+ourConnWindow)
-	c.recvWindow = int64(c.connWindow)
 	if c.maxConnBody <= 0 {
 		c.maxConnBody = defaultMaxConnBody
 	}
+	c.initWindow = min(ourInitWindow, max(c.maxBody, 65535))
+	// После значения по умолчанию для maxConnBody: иначе окно соединения было бы
+	// 65535+ourConnWindow, и один медленный потоковый обработчик останавливал бы
+	// приём тел всего соединения. Не больше maxWindow (RFC 9113 6.9.1).
+	c.connWindow = min(max(c.maxConnBody, 65535+ourConnWindow), maxWindow)
+	c.recvWindow = int64(c.connWindow)
 	var hsRead, hsIdle, hsWrite time.Duration
 	if hs := o.hs; hs != nil {
 		hsRead, hsIdle, hsWrite = hs.ReadTimeout, hs.IdleTimeout, hs.WriteTimeout
@@ -570,6 +587,7 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 		c.maxHeaderList = defaultMaxHeaderList
 	}
 	c.readTO = timeout(s.ReadTimeout, hsRead, defaultReadTO)
+	c.streamReadTO = timeout(s.ReadTimeout, hsRead, 0)
 	c.idleTO = timeout(s.IdleTimeout, hsIdle, defaultIdleTO)
 	c.writeTO = timeout(s.WriteByteTimeout, hsWrite, defaultWriteByteTO)
 	// Also replaces any deadline left by net/http before the hand-off.
@@ -621,6 +639,10 @@ func (c *conn) logPanic(r any) {
 // to re-panic so that fuzzing and race tests surface bugs instead of
 // silently dropping the connection.
 var panicHook func(any)
+
+// roundHook вызывается в конце каждого раунда чтения под c.mu. Тесты проверяют
+// в нём инварианты соединения.
+var roundHook func(*conn)
 
 func (c *conn) serve() {
 	defer func() {
@@ -734,7 +756,12 @@ func (c *conn) round(n int, rerr error) roundEnd {
 		return roundClose
 	}
 	c.noteIdleLocked()
-	c.idleAfterRound = c.isIdleConn()
+	// Обработчики-сироты (поток сброшен клиентом) не мешают читать ещё раз:
+	// RST_STREAM, GOAWAY и FIN часто приходят одним сегментом.
+	c.readAgain = len(c.streams) == 0 || c.peerGoAway || c.recvStreaming > 0
+	if roundHook != nil {
+		roundHook(c)
+	}
 	c.mu.Unlock()
 	if c.rpos == c.rend {
 		c.rpos, c.rend = 0, 0
@@ -1137,6 +1164,7 @@ func (c *conn) handleFrame(typ, flags byte, sid uint32, p []byte) error {
 		if len(p) < 8 {
 			return connError(codeFrameSize)
 		}
+		c.peerGoAway = true
 		return nil
 	case frWindowUpdate:
 		return c.onWindowUpdate(sid, p)
@@ -1178,6 +1206,9 @@ func (c *conn) release(st *stream) {
 		return
 	}
 	delete(c.streams, st.id)
+	if st.streaming && !st.halfClosed {
+		c.recvStreaming-- // тело больше не придёт
+	}
 	if st.inHandler {
 		// The worker still uses it and drops the stream when done. Until
 		// then it counts toward maxConc, so RST_STREAM cannot be used to run
@@ -1190,6 +1221,11 @@ func (c *conn) release(st *stream) {
 		if st.cancel != nil {
 			st.cancel()
 		}
+		// Потоковое тело никто не прочтёт (readBody вернёт ошибку): окно
+		// соединения за него — сейчас, а не когда обработчик вернётся.
+		if st.streaming {
+			c.dropBodyLocked(st)
+		}
 		// Ответ, который обработчик отправлял частями, больше не нужен.
 		c.unpend(st)
 		st.out = st.out[:0]
@@ -1198,6 +1234,14 @@ func (c *conn) release(st *stream) {
 	}
 	c.unpend(st)
 	c.recycle(st)
+}
+
+// halfCloseLocked отмечает END_STREAM от клиента.
+func (c *conn) halfCloseLocked(st *stream) {
+	st.halfClosed = true
+	if st.streaming {
+		c.recvStreaming--
+	}
 }
 
 // unpend снимает поток с очереди ответов, ждущих окна.
@@ -1218,20 +1262,27 @@ func (c *conn) unpend(st *stream) {
 // keeps the stream for reuse when its buffers are small. Called exactly once
 // per stream after it left c.streams and no handler uses it.
 func (c *conn) recycle(st *stream) {
-	if st.streaming {
-		// Непрочитанное потоковое тело, окно соединения за которое ещё не
-		// вернули (см. creditReadLocked): вернуть сейчас, иначе окно утечёт.
-		if n := len(st.body) - st.bodyRead - st.credited; n > 0 {
-			c.creditConnLocked(n)
-		}
-	}
-	c.bodyBytes -= st.budget
-	st.budget = 0
-	st.body = st.body[:0]
+	c.dropBodyLocked(st)
 	if len(c.free) < maxFreeStreams && cap(st.body) <= maxRetainedStreamBufs && cap(st.out) <= maxRetainedStreamBufs &&
 		cap(st.arena) <= maxRetainedArena && cap(st.fields) <= maxRetainedFields {
 		c.free = append(c.free, st)
 	}
+}
+
+// dropBodyLocked освобождает тело запроса, которое больше никто не прочтёт:
+// бюджет соединения, а для потокового тела — и окно соединения за
+// непрочитанные байты (см. creditReadLocked), иначе окно утечёт. Буферизованное
+// тело трогать можно, только когда обработчик вернулся: он читает st.body.
+func (c *conn) dropBodyLocked(st *stream) {
+	if st.streaming {
+		if n := len(st.body) - st.bodyRead - st.credited; n > 0 {
+			c.creditConnLocked(n)
+		}
+		st.bodyRead, st.credited = 0, 0
+	}
+	c.bodyBytes -= st.budget
+	st.budget = 0
+	st.body = st.body[:0]
 }
 
 // resetStream sends RST_STREAM (stream error) and forgets the stream.
@@ -1373,7 +1424,7 @@ func (c *conn) finishHeaders(sid uint32, st *stream, kind int, endStream, selfDe
 			c.resetStream(st, codeProtocol)
 			return nil
 		}
-		st.halfClosed = true
+		c.halfCloseLocked(st)
 		if st.contentLen >= 0 && st.dataLen != st.contentLen {
 			c.resetStream(st, codeProtocol)
 			return nil
@@ -1663,7 +1714,7 @@ func (c *conn) onData(flags byte, sid uint32, p []byte) error {
 		}
 	}
 	if flags&flEndStream != 0 {
-		st.halfClosed = true
+		c.halfCloseLocked(st)
 		if st.contentLen >= 0 && st.dataLen != st.contentLen {
 			c.resetStream(st, codeProtocol)
 			return nil
@@ -1692,16 +1743,15 @@ func (c *conn) creditConnLocked(n int) {
 }
 
 // creditStreamLocked возвращает клиенту n байт окна потока: копит их и
-// отправляет WINDOW_UPDATE, когда набралась половина окна. true — отправил.
-func (c *conn) creditStreamLocked(st *stream, n int) bool {
+// отправляет WINDOW_UPDATE, когда набралась половина окна.
+func (c *conn) creditStreamLocked(st *stream, n int) {
 	st.recvUnack += uint32(n)
 	if st.recvUnack < uint32(c.initWindow/2) {
-		return false
+		return
 	}
 	c.writeWindowUpdate(st.id, st.recvUnack)
 	st.recvWindow += int64(st.recvUnack)
 	st.recvUnack = 0
-	return true
 }
 
 // ---------------- control frames ----------------
@@ -1841,11 +1891,12 @@ func (c *conn) onWindowUpdate(sid uint32, p []byte) error {
 // dispatch hands a request to a worker goroutine: a fully received one, or
 // (streaming) one whose body is still arriving.
 func (c *conn) dispatch(st *stream) error {
-	if st.halfClosed {
+	if st.halfClosed || c.streamReadTO == 0 {
 		st.deadline = time.Time{} // request fully received; handler time is not limited here
 	}
-	// Иначе (streaming) ReadTimeout действует до END_STREAM: поток, у которого
-	// тело не приходит, не держит слот вечно.
+	// Иначе (streaming) явный ReadTimeout действует до END_STREAM: поток, у
+	// которого тело не приходит, не держит слот вечно. Срок от HEADERS, а
+	// readTO == streamReadTO, когда ReadTimeout задан.
 	st.inHandler = true
 	c.inflight++
 	c.srv.pool.submit(task{c, st})
@@ -1870,6 +1921,7 @@ func (c *conn) dispatchEarly() {
 			continue // уже запущен, сброшен или структура досталась другому потоку
 		}
 		st.streaming = true
+		c.recvStreaming++
 		st.credited = len(st.body) // окно за них вернули при получении
 		c.dispatch(st)
 	}
@@ -1969,6 +2021,11 @@ func (c *conn) runHandler(st *stream) {
 		// Ждать в Flush или в чтении тела могли только после Flush или при
 		// потоковом теле: оставшиеся горутины выходят.
 		st.cond.Broadcast()
+	}
+	if st.streaming && !st.orphan {
+		// Непрочитанный остаток тела уже не нужен, а ответ может ещё ждать окна:
+		// окно соединения за остаток — сейчас (новые кадры onData возвращает сразу).
+		c.dropBodyLocked(st)
 	}
 	cancel := st.cancel
 	st.ctx, st.cancel = nil, nil
@@ -2122,16 +2179,35 @@ func (c *conn) queueResponseLocked(st *stream, resp *response, final bool) {
 		c.writeHeaderFrames(st.id, c.headerBlock(resp.status, resp.fields, -1), false)
 		st.hdrSent = true
 	}
-	st.out = append(st.out, resp.body...)
-	resp.body = resp.body[:0]
 	if final {
 		st.respDone = true
 		if len(resp.trailers) > 0 {
 			st.trailers = resp.trailers
 		}
 	}
-	if c.sendOut(st) {
-		return // поток закрыт
+	body := resp.body
+	resp.body = resp.body[:0] // обработчик снова пишет только после возврата отсюда
+	if len(st.out) == 0 {
+		// Очередь пуста: тело — сразу в буфер записи, в st.out — только остаток,
+		// который не пустили окна (как writeResponse). Срок продвижения пустой
+		// очереди не взведён, его взводит pend.
+		end := st.respDone && len(st.trailers) == 0
+		rem, ended := c.sendData(st.id, &st.sendWindow, body, end)
+		if len(rem) == 0 {
+			if st.respDone {
+				if !ended {
+					c.writeHeaderFrames(st.id, c.headerBlock(0, st.trailers, -1), true)
+				}
+				c.endStream(st)
+			}
+			return
+		}
+		st.out = append(st.out, rem...)
+	} else {
+		st.out = append(st.out, body...)
+		if c.sendOut(st) {
+			return // поток закрыт
+		}
 	}
 	if len(st.out) > 0 {
 		c.pend(st)

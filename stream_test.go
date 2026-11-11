@@ -606,7 +606,7 @@ func TestStreamBodyBufferCompacts(t *testing.T) {
 	c := &conn{initWindow: ourInitWindow}
 	st := &stream{}
 	st.cond.L = &c.mu
-	st.inHandler, st.streaming, st.credited = true, true, 1<<40 // окно не возвращаем: без записи в сокет
+	st.inHandler, st.streaming, st.credited = true, true, 1<<30 // окно не возвращаем: без записи в сокет
 	chunk := make([]byte, 1000)
 	p := make([]byte, 900)
 	for i := 0; i < 1000; i++ { // 1 МБ пришло, отставание растёт до 100 КБ

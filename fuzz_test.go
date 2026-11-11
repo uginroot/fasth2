@@ -3,6 +3,7 @@ package fasth2
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,7 +13,21 @@ import (
 	"time"
 )
 
-func init() { panicHook = func(r any) { panic(r) } } // surface panics in tests
+func init() {
+	panicHook = func(r any) { panic(r) } // surface panics in tests
+	// Счётчик потоковых тел, которые ещё приходят, совпадает с потоками.
+	roundHook = func(c *conn) {
+		n := 0
+		for _, st := range c.streams {
+			if st.streaming && !st.halfClosed {
+				n++
+			}
+		}
+		if n != c.recvStreaming {
+			panic(fmt.Sprintf("recvStreaming %d, потоков с телом в пути %d", c.recvStreaming, n))
+		}
+	}
+}
 
 // ---- HPACK ----
 

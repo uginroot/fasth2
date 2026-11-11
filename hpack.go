@@ -326,16 +326,6 @@ func appendStatus(dst []byte, code int) []byte {
 	return appendUintString(dst, uint64(code))
 }
 
-func appendLiteral(dst []byte, name, value string) []byte {
-	if idx, ok := staticNameIdx[name]; ok {
-		dst = appendHpackInt(dst, 0x00, 4, idx)
-	} else {
-		dst = append(dst, 0x00)
-		dst = appendHpackString(dst, name)
-	}
-	return appendHpackString(dst, value)
-}
-
 // ---- encoder with a dynamic table (responses) ----
 
 // hpField — поле заголовка ответа: имя в нижнем регистре, значение проверено

@@ -116,10 +116,10 @@ connection starts).
 |---|---|---|---|
 | `MaxConcurrentStreams` | 250 | — | open streams, **including streams reset by the client while their handler still runs** (Rapid Reset, CVE-2023-44487) |
 | `MaxRequestBodySize` | 16 MiB | — | one request body buffered before the handler runs. Also caps the stream receive window we advertise (`min(1 MiB, MaxRequestBodySize)`, not below 64 KiB), so a streaming RPC holds at most that much unread; its total over the stream's life is not limited, as in `net/http` and gRPC (limit message size in the RPC layer, e.g. connect-go `WithReadMaxBytes`) |
-| `MaxConnBodySize` | 64 MiB | — | request body bytes buffered on one connection and not yet read by handlers; a stream over it gets `REFUSED_STREAM` (`ENHANCE_YOUR_CALM` if its handler already runs: `REFUSED_STREAM` would invite a retry) |
+| `MaxConnBodySize` | 64 MiB | — | request body bytes buffered on one connection and not yet read by handlers; a stream over it gets `REFUSED_STREAM` (`ENHANCE_YOUR_CALM` if its handler already runs: `REFUSED_STREAM` would invite a retry). Also the connection receive window we advertise (at least 1 MiB + 64 KiB, at most 2^31-1), so unread streaming bodies of all streams together hold at most that much |
 | `MaxHeaderListSize` | 1 MiB | `MaxHeaderBytes` | decoded header list (name+value+32 per field); larger requests get 431 |
 | `HandshakeTimeout` | 10s | — | client preface + first SETTINGS |
-| `ReadTimeout` | 60s | `ReadTimeout` | HEADERS → END_STREAM of a request (also of a streaming RPC whose handler already runs: long bidi streams need a larger value), and an unfinished header block |
+| `ReadTimeout` | 60s | `ReadTimeout` | HEADERS → END_STREAM of a request, and an unfinished header block. A streaming RPC whose handler already runs is bound only by an explicitly set value (here or in `http.Server`): the 60s default does not cut long bidi streams, as in `net/http` |
 | `IdleTimeout` | 120s | `IdleTimeout` (else `ReadTimeout`) | connection without open streams (then GOAWAY) |
 | `WriteByteTimeout` | 30s | `WriteTimeout` | one 64 KiB write chunk; waiting for flow-control credit (also inside `Flush`) |
 | `ErrorLog` | `log` | `ErrorLog` | where handler panics are logged |

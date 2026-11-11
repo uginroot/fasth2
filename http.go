@@ -517,12 +517,17 @@ func (w *responseWriter) finish() {
 	if !w.hasDate {
 		w.resp.addHeader("date", httpDate())
 	}
-	if w.head && !w.flushed {
-		if w.resp.rw.clen >= 0 {
-			w.resp.contentLength = w.resp.rw.clen
-		} else {
-			w.resp.contentLength = w.resp.rw.headN
+	if w.head {
+		if !w.flushed {
+			if w.resp.rw.clen >= 0 {
+				w.resp.contentLength = w.resp.rw.clen
+			} else {
+				w.resp.contentLength = w.resp.rw.headN
+			}
 		}
+		// У ответа на HEAD нет тела, и трейлеры не отправляются (как в x/net):
+		// иначе HEADERS ушли бы без content-length.
+		return
 	}
 	w.appendTrailers()
 }
