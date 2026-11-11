@@ -18,6 +18,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -58,7 +59,7 @@ const (
 	clientPreface  = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 	maxFrameSize   = 16384
 	ourInitWindow  = 1 << 20
-	ourConnWindow  = 1 << 20 // added on top of the default 65535
+	ourConnWindow  = 1 << 20 // минимум окна соединения сверх 65535 по умолчанию (см. conn.connWindow)
 	maxWindow      = 1<<31 - 1
 	maxHeaderBlock = 1 << 18
 	readBufSize    = 1 << 16
@@ -71,6 +72,9 @@ const (
 	// Writes are split into chunks of this size; each chunk gets its own
 	// write deadline (WriteByteTimeout).
 	writeChunk = 64 << 10
+	// Flush обработчика ждёт, пока в очереди потока (ответ, которому не
+	// хватило окна) больше этого числа байт.
+	maxStreamOut = 1 << 18
 
 	// At most this many SETTINGS frames with INITIAL_WINDOW_SIZE per
 	// settingsWindow; each one walks all open streams.
@@ -104,7 +108,13 @@ type request struct {
 	path       []byte
 	authority  []byte
 	header     []headerField // regular (non-pseudo) headers
-	body       []byte
+	// authorityStr, pathStr — готовые строки из таблицы HPACK или пусто.
+	authorityStr, pathStr string
+	body                  []byte
+	// streaming: обработчик запущен до END_STREAM, тело читается через
+	// conn.readBody; gen — поколение потока для этого запроса.
+	streaming bool
+	gen       uint64
 
 	c  *conn
 	st *stream
@@ -117,10 +127,10 @@ func (r *request) context() context.Context {
 	if st.ctx != nil { // only the owning worker touches ctx creation
 		return st.ctx
 	}
-	ctx, cancel := context.WithCancel(c.baseCtx)
+	ctx, cancel := context.WithCancel(c.reqParent)
 	c.mu.Lock()
 	st.ctx, st.cancel = ctx, cancel
-	dead := st.canceled || c.closed
+	dead := st.canceled || c.closed || c.baseDone
 	c.mu.Unlock()
 	if dead {
 		cancel()
@@ -131,22 +141,37 @@ func (r *request) context() context.Context {
 // response is reused between requests on a connection.
 type response struct {
 	status        int
-	contentLength int64  // -1: use len(body)
-	hdr           []byte // pre-encoded HPACK fields
-	body          []byte
+	contentLength int64 // -1: use len(body)
+	// fields и trailers кодирует conn.headerBlock в момент отправки (HPACK с
+	// динамической таблицей соединения).
+	fields   []hpField
+	body     []byte
+	trailers []hpField // пусто — трейлеров нет
+	// rw — состояние адаптера net/http, вынесенное из responseWriter, чтобы он
+	// был меньше (аллокация на запрос). Принадлежит адаптеру: тип и reset — в http.go.
+	rw rwState
 }
 
 func (r *response) reset() {
 	r.status = 200
 	r.contentLength = -1
-	r.hdr = r.hdr[:0]
+	clear(r.fields)
+	r.fields = r.fields[:0]
 	r.body = r.body[:0]
+	clear(r.trailers)
+	r.trailers = r.trailers[:0]
+	r.rw.reset()
 }
 
 // addHeader adds a response header. name must be a lowercase token and value
 // must be valid (the net/http adapter checks both). content-length is added
 // automatically.
-func (r *response) addHeader(name, value string) { r.hdr = appendLiteral(r.hdr, name, value) }
+func (r *response) addHeader(name, value string) { r.fields = append(r.fields, hpField{name, value}) }
+
+// addTrailer добавляет трейлер ответа (те же требования к имени и значению).
+func (r *response) addTrailer(name, value string) {
+	r.trailers = append(r.trailers, hpField{name, value})
+}
 
 func (r *response) write(p []byte)       { r.body = append(r.body, p...) }
 func (r *response) writeString(s string) { r.body = append(r.body, s...) }
@@ -279,6 +304,10 @@ func (w *worker) run(p *workerPool, t task) {
 }
 
 type stream struct {
+	// cond (на c.mu) будит обработчик, который ждёт в Flush окна клиента или
+	// данных тела запроса, а также при сбросе потока и закрытии соединения.
+	cond       sync.Cond
+	gen        uint64 // растёт при каждом новом запросе на этой структуре
 	id         uint32
 	halfClosed bool // END_STREAM received
 	gotHeaders bool
@@ -295,28 +324,47 @@ type stream struct {
 	path       []byte
 	scheme     []byte
 	authority  []byte
-	body       []byte
-	out        []byte
-	ctx        context.Context
-	cancel     context.CancelFunc
-	inHandler  bool // owned by a worker goroutine
-	canceled   bool // stream went away while its handler was running
-	orphan     bool // released while inHandler; still counts toward maxConc
-	// deadline: request must be fully received by then (before dispatch), or
-	// a flow-blocked response must make progress by then (pending).
+	// authorityStr, pathStr — строки :authority и :path из таблицы HPACK
+	// (пусто, если поле пришло литералом).
+	authorityStr, pathStr string
+	body                  []byte
+	out                   []byte
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	inHandler             bool // owned by a worker goroutine
+	streaming             bool // обработчик запущен до END_STREAM: тело приходит, пока он работает
+	duplexType            bool // content-type потокового RPC (gRPC, gRPC-Web, Connect streaming)
+	bodyRead              int  // streaming: сколько байт body уже прочитал обработчик
+	// credited — streaming: непрочитанные байты, пришедшие до запуска
+	// обработчика. Окно за них клиенту уже вернули (при получении), поэтому
+	// readBody при их чтении окно не возвращает.
+	credited int
+	budget   int  // байт этого потока в c.bodyBytes
+	canceled bool // stream went away while its handler was running
+	orphan   bool // released while inHandler; still counts toward maxConc
+	// deadline: request must be fully received by then (HEADERS → END_STREAM).
 	deadline time.Time
-	req      request
-	resp     response
+	// Ответ, который отправляется по частям (окно потока кончилось или
+	// обработчик вызвал Flush):
+	hdrSent   bool      // HEADERS ответа уже отправлены
+	respDone  bool      // обработчик вернулся: весь ответ уже в out и trailers
+	trailers  []hpField // трейлеры; уходят после out с END_STREAM
+	wdeadline time.Time // ответ, ждущий окна, должен продвинуться до этого срока
+	req       request
+	resp      response
 }
 
-func (s *stream) reset(id uint32, sendWin int64) {
+func (s *stream) reset(id uint32, sendWin, recvWin int64) {
+	s.gen++
 	s.id = id
 	s.halfClosed, s.gotHeaders, s.pending = false, false, false
 	s.inHandler, s.canceled, s.orphan = false, false, false
-	s.deadline = time.Time{}
+	s.streaming, s.bodyRead, s.budget, s.duplexType, s.credited = false, 0, 0, false, 0
+	s.deadline, s.wdeadline = time.Time{}, time.Time{}
+	s.hdrSent, s.respDone, s.trailers = false, false, nil
 	s.ctx, s.cancel = nil, nil
 	s.sendWindow = sendWin
-	s.recvWindow = ourInitWindow
+	s.recvWindow = recvWin
 	s.recvUnack = 0
 	s.contentLen = -1
 	s.dataLen = 0
@@ -324,6 +372,7 @@ func (s *stream) reset(id uint32, sendWin int64) {
 	s.arena = s.arena[:0]
 	s.fields = s.fields[:0]
 	s.method, s.path, s.scheme, s.authority = nil, nil, nil, nil
+	s.authorityStr, s.pathStr = "", ""
 	s.body = s.body[:0]
 	s.out = s.out[:0]
 }
@@ -344,6 +393,10 @@ const (
 type conn struct {
 	srv *Server
 	nc  net.Conn
+	raw syscall.RawConn // h2c: читатель работает в serveRaw (запись и чтение под c.mu)
+	// idleAfterRound: после последнего раунда открытых потоков нет — serveRaw
+	// читает ещё раз, чтобы не пропустить EOF. Пишет и читает только читатель.
+	idleAfterRound bool
 
 	// mu guards all connection state below except the read buffer, which is
 	// owned by the reader goroutine.
@@ -363,8 +416,13 @@ type conn struct {
 	writeTO       time.Duration
 	errorLog      *log.Logger
 
-	orphans   int // streams released while their handler still runs
-	bodyBytes int // request body bytes buffered on this connection
+	orphans int // streams released while their handler still runs
+	// inflight — обработчики этого соединения, которые запущены и не вернулись.
+	// flushYield: один из вернувшихся уступил процессор и потом сбросит c.wbuf.
+	inflight   int
+	parked     int // из inflight: ждут в readBody или flushWait (ответа сейчас не допишут)
+	flushYield bool
+	bodyBytes  int // request body bytes buffered on this connection
 
 	// read deadline bookkeeping; rdl is the deadline set on nc. Deadlines may
 	// be stale (earlier than needed): the reader then wakes up and re-arms.
@@ -377,8 +435,14 @@ type conn struct {
 	iwWindow time.Time // SETTINGS INITIAL_WINDOW_SIZE rate limit
 	iwCount  int
 
-	handler    handlerFunc
-	baseCtx    context.Context
+	handler handlerFunc
+	baseCtx context.Context
+	// reqParent — родитель контекстов запросов: значения baseCtx без его отмены.
+	// Так context.WithCancel не регистрирует каждый запрос в контексте
+	// соединения net/http (блокировка и map на запрос). Отмену baseCtx ловит
+	// один context.AfterFunc на соединение (cancelFromBase).
+	reqParent  context.Context
+	baseDone   bool // baseCtx отменён: новые запросы получают отменённый контекст
 	remoteAddr string
 	tlsState   *tls.ConnectionState
 	rbuf       []byte
@@ -387,12 +451,14 @@ type conn struct {
 	wbuf       []byte
 	hbuf       []byte
 	dec        hpackDecoder
+	enc        hpackEncoder // заголовки ответов; только под c.mu
 
 	prefaceDone  bool
 	settingsSeen bool
 
 	streams map[uint32]*stream
 	pending []*stream
+	early   []earlyStream // запросы без content-length, ждущие конца раунда чтения
 	free    []*stream
 	discard stream // decodes header blocks of refused streams and trailers
 
@@ -407,6 +473,16 @@ type conn struct {
 	recvUnack      uint32
 	maxConc        int
 	maxBody        int
+	// initWindow — окно приёма потока, которое объявляем клиенту:
+	// min(ourInitWindow, maxBody), но не меньше 65535 (до нашего SETTINGS клиент
+	// вправе послать столько). Непрочитанное потоковое тело не больше него.
+	initWindow int
+	// connWindow — окно приёма соединения: не меньше 65535+ourConnWindow и не
+	// меньше MaxConnBodySize. Буферизованные тела возвращают окно при получении,
+	// потоковые — когда обработчик читает (creditReadLocked): так непрочитанное
+	// потоковое тело всех потоков ограничено окном соединения, и клиент ждёт,
+	// а не получает сброс.
+	connWindow int
 
 	// header block being assembled (HEADERS + CONTINUATION)
 	hbID        uint32
@@ -451,6 +527,7 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 		rbuf:           make([]byte, readBufSize),
 		wbuf:           make([]byte, 0, 32*1024),
 		dec:            newDecoder(),
+		enc:            newEncoder(),
 		streams:        make(map[uint32]*stream),
 		peerInitWindow: 65535,
 		peerMaxFrame:   maxFrameSize,
@@ -470,6 +547,9 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 	if c.maxBody <= 0 {
 		c.maxBody = defaultMaxBody
 	}
+	c.initWindow = min(ourInitWindow, max(c.maxBody, 65535))
+	c.connWindow = max(c.maxConnBody, 65535+ourConnWindow)
+	c.recvWindow = int64(c.connWindow)
 	if c.maxConnBody <= 0 {
 		c.maxConnBody = defaultMaxConnBody
 	}
@@ -501,6 +581,14 @@ func (s *Server) serveConn(nc net.Conn, o connOpts) {
 	nc.SetWriteDeadline(time.Time{})
 	if c.baseCtx == nil {
 		c.baseCtx = context.Background()
+	}
+	c.reqParent = context.WithoutCancel(c.baseCtx)
+	if _, ok := c.baseCtx.Deadline(); ok {
+		c.reqParent = c.baseCtx // WithoutCancel потерял бы срок базового контекста
+	}
+	if c.baseCtx.Done() != nil {
+		stop := context.AfterFunc(c.baseCtx, c.cancelFromBase)
+		defer stop()
 	}
 	if ra := nc.RemoteAddr(); ra != nil {
 		c.remoteAddr = ra.String()
@@ -552,57 +640,109 @@ func (c *conn) serve() {
 		c.nc.Close()
 		return
 	}
+	if c.serveRawIfPossible() { // h2c на unix: см. raw_unix.go
+		return
+	}
 	for {
 		n, rerr := c.nc.Read(c.rbuf[c.rend:])
-		c.mu.Lock()
-		c.rend += n
-		perr := c.processFramesSafe()
-		if perr == nil && rerr != nil && errors.Is(rerr, os.ErrDeadlineExceeded) {
-			rerr = nil
-			perr = c.onReadDeadlineLocked()
-		}
-		if perr != nil {
-			c.closed = true
-			var ce connError
-			if errors.As(perr, &ce) {
-				// Let an in-flight write finish so GOAWAY goes last. The
-				// writer stops after its current chunk (c.closed is set);
-				// the write deadline bounds the wait.
-				for c.writing {
-					c.wcond.Wait()
-				}
-				c.closed = false
-				c.writeGoAway(uint32(ce))
-				c.flushLocked()
-				c.closed = true
-				c.mu.Unlock()
-				c.closeGracefully()
-				return
-			}
-			c.mu.Unlock()
-			c.nc.Close()
+		if end := c.round(n, rerr); end != roundGoOn {
+			c.finish(end)
 			return
-		}
-		c.flushLocked()
-		c.maybeFinishLocked()
-		if rerr == nil && !c.closed {
-			c.drainLocked()
-		}
-		if rerr != nil || c.closed {
-			c.closed = true
-			c.mu.Unlock()
-			c.nc.Close()
-			return
-		}
-		c.noteIdleLocked()
-		c.mu.Unlock()
-		if c.rpos == c.rend {
-			c.rpos, c.rend = 0, 0
-		} else if len(c.rbuf)-c.rpos < 9+maxFrameSize {
-			c.rend = copy(c.rbuf, c.rbuf[c.rpos:c.rend])
-			c.rpos = 0
 		}
 	}
+}
+
+// readDeadlinePassed: срок чтения соединения (c.rdl) уже наступил. Нужен
+// serveRaw: пока каждый read заполняет буфер, он не возвращается в ожидание
+// готовности, где рантайм проверил бы срок.
+func (c *conn) readDeadlinePassed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.rdl.IsZero() && !time.Now().Before(c.rdl)
+}
+
+// roundEnd — чем закончился раунд чтения (round).
+type roundEnd int
+
+const (
+	roundGoOn            roundEnd = iota
+	roundClose                    // закрыть соединение
+	roundCloseGracefully          // GOAWAY уже в буфере: закрыть мягко (closeGracefully)
+)
+
+// finish закрывает соединение после последнего раунда. Вызывается вне c.mu и
+// вне RawConn.Read.
+func (c *conn) finish(end roundEnd) {
+	if end == roundCloseGracefully {
+		c.closeGracefully()
+		return
+	}
+	c.nc.Close()
+}
+
+// abortLocked закрывает соединение из-под c.mu (например, после ошибки записи).
+// В serveRaw Close ждал бы читателя, который держит fd и может ждать c.mu:
+// shutdown будит читателя (read вернёт 0), и Close делает он сам.
+func (c *conn) abortLocked() {
+	if c.raw != nil {
+		shutdownRaw(c.raw)
+		return
+	}
+	c.nc.Close()
+}
+
+// round обрабатывает результат одного read: n новых байт в c.rbuf и ошибку.
+func (c *conn) round(n int, rerr error) roundEnd {
+	c.mu.Lock()
+	c.rend += n
+	perr := c.processFramesSafe()
+	if perr == nil && rerr != nil && errors.Is(rerr, os.ErrDeadlineExceeded) {
+		rerr = nil
+		perr = c.onReadDeadlineLocked()
+	}
+	if perr != nil {
+		c.closed = true
+		var ce connError
+		if errors.As(perr, &ce) {
+			// Let an in-flight write finish so GOAWAY goes last. The
+			// writer stops after its current chunk (c.closed is set);
+			// the write deadline bounds the wait.
+			for c.writing {
+				c.wcond.Wait()
+			}
+			c.closed = false
+			c.writeGoAway(uint32(ce))
+			c.flushLocked()
+			c.closed = true
+			c.mu.Unlock()
+			return roundCloseGracefully
+		}
+		c.mu.Unlock()
+		return roundClose
+	}
+	if rerr == nil {
+		c.dispatchEarly() // в раунде с EOF или ошибкой чтения соединение закрывается
+	}
+	c.flushLocked()
+	c.maybeFinishLocked()
+	if rerr == nil && !c.closed {
+		c.drainLocked()
+	}
+	if rerr != nil || c.closed {
+		c.closed = true
+		c.mu.Unlock()
+		return roundClose
+	}
+	c.noteIdleLocked()
+	c.idleAfterRound = c.isIdleConn()
+	c.mu.Unlock()
+	if c.rpos == c.rend {
+		c.rpos, c.rend = 0, 0
+	} else if len(c.rbuf)-c.rpos < 9+maxFrameSize {
+		c.rend = copy(c.rbuf, c.rbuf[c.rpos:c.rend])
+		c.rpos = 0
+	}
+	return roundGoOn
 }
 
 // processFramesSafe runs processFrames and turns a panic (a bug in frame
@@ -678,15 +818,19 @@ func (c *conn) onReadDeadlineLocked() error {
 	if !c.streamDL.IsZero() && !now.Before(c.streamDL) {
 		c.streamDL = time.Time{}
 		for _, st := range c.streams {
-			if st.deadline.IsZero() || (c.hbID != 0 && st == c.hbStream) {
+			dl := st.deadline
+			if !st.wdeadline.IsZero() && (dl.IsZero() || st.wdeadline.Before(dl)) {
+				dl = st.wdeadline
+			}
+			if dl.IsZero() || (c.hbID != 0 && st == c.hbStream) {
 				continue
 			}
-			if !now.Before(st.deadline) {
+			if !now.Before(dl) {
 				c.resetStream(st, codeCancel)
 				continue
 			}
-			if c.streamDL.IsZero() || st.deadline.Before(c.streamDL) {
-				c.streamDL = st.deadline
+			if c.streamDL.IsZero() || dl.Before(c.streamDL) {
+				c.streamDL = dl
 			}
 		}
 	}
@@ -737,7 +881,9 @@ func (c *conn) drainLocked() {
 
 // maybeFinishLocked closes a connection that sent GOAWAY and has no streams left.
 func (c *conn) maybeFinishLocked() {
-	if !c.goingAway || c.closed || len(c.streams) > 0 || c.orphans > 0 || c.writing {
+	// flushYield: в c.wbuf лежат склеенные ответы, их сбросит горутина, которая
+	// уступила процессор, и потом сама вызовет maybeFinishLocked.
+	if !c.goingAway || c.closed || len(c.streams) > 0 || c.orphans > 0 || c.writing || c.flushYield {
 		return
 	}
 	c.closed = true
@@ -750,6 +896,21 @@ func (c *conn) maybeFinishLocked() {
 	}
 }
 
+// cancelFromBase отменяет контексты запросов, когда отменён baseCtx (как в
+// net/http, где контекст запроса — потомок контекста соединения).
+func (c *conn) cancelFromBase() {
+	c.mu.Lock()
+	c.baseDone = true
+	for _, st := range c.streams {
+		if st.cancel != nil {
+			st.cancel()
+		}
+		st.cond.Broadcast() // ждущие в Read и Flush выходят с ошибкой
+	}
+	c.wcond.Broadcast()
+	c.mu.Unlock()
+}
+
 func (c *conn) cancelInflight() {
 	c.mu.Lock()
 	c.closed = true
@@ -758,6 +919,7 @@ func (c *conn) cancelInflight() {
 		if st.cancel != nil {
 			st.cancel()
 		}
+		st.cond.Broadcast()
 	}
 	c.mu.Unlock()
 }
@@ -794,11 +956,32 @@ func (c *conn) flushLocked() {
 		}
 		if err != nil {
 			c.closed = true
-			c.nc.Close()
+			c.abortLocked()
 		}
 	}
 	c.writing = false
 	c.wcond.Broadcast()
+}
+
+// flushBatchLocked сбрасывает c.wbuf после ответа обработчика. Если другие
+// обработчики этого соединения ещё работают, сначала один раз уступает
+// процессор (runtime.Gosched): те, кто готов, успевают дописать свои ответы,
+// и пачка уходит одним write. Без этого при GOMAXPROCS=1 каждый ответ уходит
+// отдельным write (склейка в flushLocked работает, только пока кто-то пишет).
+// Пока одна горутина уступила, остальные только дописывают в c.wbuf.
+// Медленный обработчик пачку не держит: уступка одна, после неё — сброс.
+func (c *conn) flushBatchLocked() {
+	if c.flushYield {
+		return // c.wbuf сбросит горутина, которая уступила процессор
+	}
+	if c.inflight-c.parked > 0 && !c.writing {
+		c.flushYield = true
+		c.mu.Unlock()
+		runtime.Gosched()
+		c.mu.Lock()
+		c.flushYield = false
+	}
+	c.flushLocked()
 }
 
 // writeAll writes b in chunks; each chunk must complete within the write
@@ -840,10 +1023,10 @@ func (c *conn) writeServerPreface() {
 	c.wbuf = append(c.wbuf, 0, 3) // MAX_CONCURRENT_STREAMS
 	c.wbuf = appendU32(c.wbuf, uint32(c.maxConc))
 	c.wbuf = append(c.wbuf, 0, 4) // INITIAL_WINDOW_SIZE
-	c.wbuf = appendU32(c.wbuf, ourInitWindow)
+	c.wbuf = appendU32(c.wbuf, uint32(c.initWindow))
 	c.wbuf = append(c.wbuf, 0, 6) // MAX_HEADER_LIST_SIZE
 	c.wbuf = appendU32(c.wbuf, uint32(c.maxHeaderList))
-	c.writeWindowUpdate(0, ourConnWindow)
+	c.writeWindowUpdate(0, uint32(c.connWindow-65535))
 }
 
 func (c *conn) writeRST(sid, code uint32) {
@@ -984,15 +1167,10 @@ func (c *conn) newStream(sid uint32) *stream {
 		c.free = c.free[:n-1]
 	} else {
 		st = &stream{}
+		st.cond.L = &c.mu
 	}
-	st.reset(sid, c.peerInitWindow)
+	st.reset(sid, c.peerInitWindow, int64(c.initWindow))
 	return st
-}
-
-// closeStream finishes a stream normally.
-func (c *conn) closeStream(st *stream) {
-	c.ringPush(st.id, false)
-	c.release(st)
 }
 
 func (c *conn) release(st *stream) {
@@ -1012,25 +1190,43 @@ func (c *conn) release(st *stream) {
 		if st.cancel != nil {
 			st.cancel()
 		}
+		// Ответ, который обработчик отправлял частями, больше не нужен.
+		c.unpend(st)
+		st.out = st.out[:0]
+		st.cond.Broadcast()
 		return
 	}
-	if st.pending {
-		st.pending = false
-		for i, p := range c.pending {
-			if p == st {
-				c.pending = append(c.pending[:i], c.pending[i+1:]...)
-				break
-			}
+	c.unpend(st)
+	c.recycle(st)
+}
+
+// unpend снимает поток с очереди ответов, ждущих окна.
+func (c *conn) unpend(st *stream) {
+	if !st.pending {
+		return
+	}
+	st.pending = false
+	for i, p := range c.pending {
+		if p == st {
+			c.pending = append(c.pending[:i], c.pending[i+1:]...)
+			break
 		}
 	}
-	c.recycle(st)
 }
 
 // recycle releases a finished stream's body from the connection budget and
 // keeps the stream for reuse when its buffers are small. Called exactly once
 // per stream after it left c.streams and no handler uses it.
 func (c *conn) recycle(st *stream) {
-	c.bodyBytes -= len(st.body)
+	if st.streaming {
+		// Непрочитанное потоковое тело, окно соединения за которое ещё не
+		// вернули (см. creditReadLocked): вернуть сейчас, иначе окно утечёт.
+		if n := len(st.body) - st.bodyRead - st.credited; n > 0 {
+			c.creditConnLocked(n)
+		}
+	}
+	c.bodyBytes -= st.budget
+	st.budget = 0
 	st.body = st.body[:0]
 	if len(c.free) < maxFreeStreams && cap(st.body) <= maxRetainedStreamBufs && cap(st.out) <= maxRetainedStreamBufs &&
 		cap(st.arena) <= maxRetainedArena && cap(st.fields) <= maxRetainedFields {
@@ -1182,6 +1378,11 @@ func (c *conn) finishHeaders(sid uint32, st *stream, kind int, endStream, selfDe
 			c.resetStream(st, codeProtocol)
 			return nil
 		}
+		if st.streaming { // обработчик уже работает: тело закончилось
+			st.deadline = time.Time{}
+			st.cond.Broadcast()
+			return nil
+		}
 		return c.dispatch(st)
 	}
 	// kindNew
@@ -1202,6 +1403,11 @@ func (c *conn) finishHeaders(sid uint32, st *stream, kind int, endStream, selfDe
 		}
 		return c.dispatch(st)
 	}
+	if st.contentLen < 0 && st.duplexType {
+		// Потоковый RPC без длины тела: если тело не придёт целиком в этом
+		// раунде чтения, обработчик запустится до END_STREAM.
+		c.early = append(c.early, earlyStream{st, sid})
+	}
 	return nil
 }
 
@@ -1209,7 +1415,7 @@ func (c *conn) finishHeaders(sid uint32, st *stream, kind int, endStream, selfDe
 // client is still sending the request, the stream is then reset with
 // NO_ERROR (RFC 9113 8.1) and late frames are ignored.
 func (c *conn) rejectHeaderTooLarge(st *stream, endStream bool) {
-	hb := appendStatus(c.hbuf[:0], 431)
+	hb := appendStatus(c.enc.begin(c.hbuf[:0]), 431)
 	hb = appendHpackInt(hb, 0x00, 4, 28) // content-length: 0
 	hb = appendUintString(hb, 0)
 	c.hbuf = hb
@@ -1265,11 +1471,11 @@ func parseRequest(st *stream) bool {
 			case ":method":
 				bit, st.method = hasMethod, f.Value
 			case ":path":
-				bit, st.path = hasPath, f.Value
+				bit, st.path, st.pathStr = hasPath, f.Value, f.sval
 			case ":scheme":
 				bit, st.scheme = hasScheme, f.Value
 			case ":authority":
-				bit, st.authority = hasAuthority, f.Value
+				bit, st.authority, st.authorityStr = hasAuthority, f.Value, f.sval
 			default:
 				return false
 			}
@@ -1293,6 +1499,8 @@ func parseRequest(st *stream) bool {
 			if string(f.Value) != "trailers" {
 				return false
 			}
+		case "content-type":
+			st.duplexType = isDuplexType(f.Value)
 		case "content-length":
 			v, ok := parseUint(f.Value)
 			if !ok || (st.contentLen >= 0 && st.contentLen != v) {
@@ -1322,6 +1530,18 @@ func parseRequest(st *stream) bool {
 		return seen&(hasPath|hasScheme) == 0 && seen&hasAuthority != 0 && len(st.authority) > 0
 	}
 	return seen&(hasPath|hasScheme) == hasPath|hasScheme && validScheme(st.scheme) && validPath(st.path, st.method)
+}
+
+// isDuplexType: content-type RPC, у которых клиент может ждать ответа на первое
+// сообщение, прежде чем послать следующее (bidi и client stream). Для них
+// обработчик запускается до END_STREAM. Остальные запросы без content-length
+// буферизуются целиком, как раньше (так fasth2 проходит все тесты h2spec).
+func isDuplexType(v []byte) bool {
+	return hasPrefixFold(v, "application/grpc") || hasPrefixFold(v, "application/connect+")
+}
+
+func hasPrefixFold(v []byte, prefix string) bool {
+	return len(v) >= len(prefix) && equalFold(v[:len(prefix)], []byte(prefix))
 }
 
 func equalFold(a, b []byte) bool {
@@ -1374,12 +1594,10 @@ func (c *conn) onData(flags byte, sid uint32, p []byte) error {
 	if c.recvWindow < 0 {
 		return connError(codeFlowControl)
 	}
-	c.recvUnack += uint32(flen)
-	if c.recvUnack >= ourConnWindow/2 {
-		c.writeWindowUpdate(0, c.recvUnack)
-		c.recvWindow += int64(c.recvUnack)
-		c.recvUnack = 0
-	}
+	// Окно соединения за кадр возвращается сразу, кроме данных потокового тела,
+	// которое ещё не прочитано (см. connWindow): их вернёт creditReadLocked.
+	connCredit := flen
+	defer func() { c.creditConnLocked(connCredit) }()
 	var st *stream
 	if sid <= c.lastStreamID {
 		st = c.streams[sid]
@@ -1407,33 +1625,83 @@ func (c *conn) onData(flags byte, sid uint32, p []byte) error {
 		c.resetStream(st, codeProtocol)
 		return nil
 	}
-	if len(st.body)+len(p) > c.maxBody {
+	// credit — сколько окна потока вернуть клиенту за этот кадр.
+	credit := flen
+	// Потоковое тело: в памяти только непрочитанное, его ограничивает окно
+	// потока c.initWindow (не больше MaxRequestBodySize, возвращается по мере
+	// чтения, см. readBody). Общий объём за жизнь потока не ограничен, как в
+	// net/http и gRPC. Тело, которое буферизуется целиком, — не больше maxBody.
+	// Потоковый RPC (duplexType без content-length) не ограничен общим объёмом
+	// и до запуска обработчика: его непрочитанное держит окно потока.
+	if !st.streaming && !(st.duplexType && st.contentLen < 0) && st.dataLen > int64(c.maxBody) {
 		c.resetStream(st, codeCancel)
 		return nil
 	}
-	// Flow-control windows are replenished on receipt, so they do not bound
-	// buffered bodies; this per-connection budget does.
-	if c.bodyBytes+len(p) > c.maxConnBody {
-		c.resetStream(st, codeRefusedStream)
-		return nil
+	if st.streaming && !st.inHandler {
+		// Обработчик уже вернулся, ответ ещё уходит: тело никому не нужно.
+	} else {
+		// Flow-control windows are replenished on receipt, so they do not bound
+		// buffered bodies; this per-connection budget does.
+		if c.bodyBytes+len(p) > c.maxConnBody {
+			// REFUSED_STREAM значит «запрос не обрабатывался, можно повторить»:
+			// для потока, обработчик которого уже запущен, это неправда, и клиент
+			// (grpc-go и др.) повторил бы неидемпотентный вызов.
+			code := uint32(codeRefusedStream)
+			if st.streaming {
+				code = codeEnhanceYourCalm
+			}
+			c.resetStream(st, code)
+			return nil
+		}
+		st.body = append(st.body, p...)
+		c.bodyBytes += len(p)
+		st.budget += len(p)
+		if st.streaming {
+			credit = flen - len(p) // паддинг сразу, данные — когда обработчик прочтёт
+			connCredit = credit
+			st.cond.Broadcast()
+		}
 	}
-	st.body = append(st.body, p...)
-	c.bodyBytes += len(p)
 	if flags&flEndStream != 0 {
 		st.halfClosed = true
 		if st.contentLen >= 0 && st.dataLen != st.contentLen {
 			c.resetStream(st, codeProtocol)
 			return nil
 		}
+		if st.streaming {
+			st.deadline = time.Time{}
+			st.cond.Broadcast()
+			return nil
+		}
 		return c.dispatch(st)
 	}
-	st.recvUnack += uint32(flen)
-	if st.recvUnack >= ourInitWindow/2 {
-		c.writeWindowUpdate(sid, st.recvUnack)
-		st.recvWindow += int64(st.recvUnack)
-		st.recvUnack = 0
-	}
+	c.creditStreamLocked(st, credit)
 	return nil
+}
+
+// creditConnLocked возвращает клиенту n байт окна соединения: копит их и
+// отправляет WINDOW_UPDATE, когда набралась половина окна.
+func (c *conn) creditConnLocked(n int) {
+	c.recvUnack += uint32(n)
+	if c.recvUnack < uint32(c.connWindow/2) {
+		return
+	}
+	c.writeWindowUpdate(0, c.recvUnack)
+	c.recvWindow += int64(c.recvUnack)
+	c.recvUnack = 0
+}
+
+// creditStreamLocked возвращает клиенту n байт окна потока: копит их и
+// отправляет WINDOW_UPDATE, когда набралась половина окна. true — отправил.
+func (c *conn) creditStreamLocked(st *stream, n int) bool {
+	st.recvUnack += uint32(n)
+	if st.recvUnack < uint32(c.initWindow/2) {
+		return false
+	}
+	c.writeWindowUpdate(st.id, st.recvUnack)
+	st.recvWindow += int64(st.recvUnack)
+	st.recvUnack = 0
+	return true
 }
 
 // ---------------- control frames ----------------
@@ -1496,6 +1764,8 @@ func (c *conn) onSettings(flags byte, sid uint32, p []byte) error {
 				return connError(codeFlowControl)
 			}
 			newInit, haveInit = int64(val), true
+		case 1: // HEADER_TABLE_SIZE: размер таблицы для наших заголовков
+			c.enc.setLimit(val)
 		case 5: // MAX_FRAME_SIZE
 			if val < 16384 || val > 1<<24-1 {
 				return connError(codeProtocol)
@@ -1568,12 +1838,98 @@ func (c *conn) onWindowUpdate(sid uint32, p []byte) error {
 
 // ---------------- responses ----------------
 
-// dispatch hands a fully received request to a worker goroutine.
+// dispatch hands a request to a worker goroutine: a fully received one, or
+// (streaming) one whose body is still arriving.
 func (c *conn) dispatch(st *stream) error {
-	st.deadline = time.Time{} // request fully received; handler time is not limited here
+	if st.halfClosed {
+		st.deadline = time.Time{} // request fully received; handler time is not limited here
+	}
+	// Иначе (streaming) ReadTimeout действует до END_STREAM: поток, у которого
+	// тело не приходит, не держит слот вечно.
 	st.inHandler = true
+	c.inflight++
 	c.srv.pool.submit(task{c, st})
 	return nil
+}
+
+type earlyStream struct {
+	st *stream
+	id uint32
+}
+
+// dispatchEarly запускает обработчики потоковых RPC без content-length (см.
+// isDuplexType), тело которых не закончилось за этот раунд чтения. Так работают bidi и client
+// stream в gRPC и Connect: клиент ждёт ответа на первое сообщение, прежде чем
+// послать следующее. Запросы, пришедшие целиком, уже ушли в dispatch обычным
+// путём (тело в буфере, без ожидания).
+func (c *conn) dispatchEarly() {
+	for i, e := range c.early {
+		c.early[i] = earlyStream{}
+		st := e.st
+		if c.closed || c.streams[e.id] != st || st.inHandler || st.halfClosed {
+			continue // уже запущен, сброшен или структура досталась другому потоку
+		}
+		st.streaming = true
+		st.credited = len(st.body) // окно за них вернули при получении
+		c.dispatch(st)
+	}
+	c.early = c.early[:0]
+}
+
+// readBody читает тело запроса, которое ещё приходит (streaming). Ждёт данных
+// или END_STREAM; ошибка — если поток сброшен, соединение закрыто или
+// обработчик уже вернулся (gen).
+func (c *conn) readBody(st *stream, gen uint64, p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for {
+		if st.gen != gen || !st.inHandler {
+			return 0, http.ErrBodyReadAfterClose
+		}
+		if st.canceled || c.closed || c.baseDone {
+			return 0, errStreamClosed
+		}
+		if st.bodyRead < len(st.body) {
+			n := copy(p, st.body[st.bodyRead:])
+			st.bodyRead += n
+			st.budget -= n
+			c.bodyBytes -= n
+			if st.bodyRead == len(st.body) {
+				st.body, st.bodyRead = st.body[:0], 0
+			} else if st.bodyRead >= 4096 && st.bodyRead >= len(st.body)/2 {
+				// Обработчик отстаёт, но читает: хвост в начало, иначе буфер
+				// вырос бы на весь объём потока (onData дописывает в конец).
+				st.body, st.bodyRead = st.body[:copy(st.body, st.body[st.bodyRead:])], 0
+			}
+			c.creditReadLocked(st, n)
+			return n, nil
+		}
+		if st.halfClosed {
+			return 0, io.EOF
+		}
+		c.parked++
+		st.cond.Wait()
+		c.parked--
+	}
+}
+
+// creditReadLocked возвращает клиенту окно потока за n прочитанных байт
+// потокового тела (кроме тех, что пришли до запуска обработчика). Так быстрый
+// клиент ждёт медленного обработчика, а не получает сброс: в памяти на поток —
+// не больше окна (c.initWindow).
+func (c *conn) creditReadLocked(st *stream, n int) {
+	from := min(n, st.credited)
+	st.credited -= from
+	if n -= from; n == 0 {
+		return
+	}
+	c.creditConnLocked(n) // окно соединения — всегда: поток мог закончиться, соединение живо
+	if !st.halfClosed {
+		c.creditStreamLocked(st, n)
+	}
+	if len(c.wbuf) > 0 {
+		c.flushLocked()
+	}
 }
 
 // runHandler executes on a worker goroutine.
@@ -1581,12 +1937,20 @@ func (c *conn) runHandler(st *stream) {
 	req, resp := &st.req, &st.resp
 	req.c, req.st, req.remoteAddr, req.tls = c, st, c.remoteAddr, c.tlsState
 	req.method, req.path, req.authority = st.method, st.path, st.authority
+	req.authorityStr, req.pathStr = st.authorityStr, st.pathStr
 	if st.regStart >= 0 {
 		req.header = st.fields[st.regStart:]
 	} else {
 		req.header = nil
 	}
-	req.body = st.body
+	// streaming и gen заданы до dispatch. Тело потокового запроса читатель
+	// соединения дописывает под c.mu, поэтому здесь его не трогаем (readBody).
+	req.streaming, req.gen = st.streaming, st.gen
+	if st.streaming {
+		req.body = nil
+	} else {
+		req.body = st.body
+	}
 	resp.reset()
 	panicked := true
 	func() {
@@ -1600,6 +1964,12 @@ func (c *conn) runHandler(st *stream) {
 	}()
 	c.mu.Lock()
 	st.inHandler = false
+	c.inflight--
+	if st.hdrSent || st.streaming {
+		// Ждать в Flush или в чтении тела могли только после Flush или при
+		// потоковом теле: оставшиеся горутины выходят.
+		st.cond.Broadcast()
+	}
 	cancel := st.cancel
 	st.ctx, st.cancel = nil, nil
 	switch {
@@ -1611,10 +1981,12 @@ func (c *conn) runHandler(st *stream) {
 		// connection is gone; the stream may still sit in c.streams
 	case panicked:
 		c.resetStream(st, codeInternal)
+	case st.hdrSent: // был Flush: досылаем остаток, трейлеры и END_STREAM
+		c.queueResponseLocked(st, resp, true)
 	default:
 		c.writeResponse(st, resp)
 	}
-	c.flushLocked()
+	c.flushBatchLocked()
 	c.maybeFinishLocked()
 	c.noteIdleLocked()
 	c.mu.Unlock()
@@ -1623,37 +1995,192 @@ func (c *conn) runHandler(st *stream) {
 	}
 }
 
-func (c *conn) writeResponse(st *stream, resp *response) error {
-	hb := appendStatus(c.hbuf[:0], resp.status)
-	hb = append(hb, resp.hdr...)
-	if resp.status != 204 && resp.status != 304 {
-		cl := resp.contentLength
+// writeResponse отправляет ответ обработчика, который не вызывал Flush:
+// HEADERS (с content-length, если трейлеров нет), тело и трейлеры. Остаток,
+// который не пускают окна, ждёт в st.out (см. flushPending).
+func (c *conn) writeResponse(st *stream, resp *response) {
+	hasTrailers := len(resp.trailers) > 0
+	cl := int64(-1)
+	if resp.status != 204 && resp.status != 304 && !hasTrailers {
+		cl = resp.contentLength
 		if cl < 0 {
 			cl = int64(len(resp.body))
 		}
-		hb = appendHpackInt(hb, 0x00, 4, 28) // content-length
+	}
+	hb := c.headerBlock(resp.status, resp.fields, cl)
+	end := len(resp.body) == 0 && !hasTrailers
+	c.writeHeaderFrames(st.id, hb, end)
+	if end {
+		c.endStream(st)
+		return
+	}
+	st.hdrSent, st.respDone = true, true
+	if hasTrailers {
+		st.trailers = resp.trailers // resp принадлежит потоку до recycle
+	}
+	rem, ended := c.sendData(st.id, &st.sendWindow, resp.body, !hasTrailers)
+	if len(rem) == 0 {
+		if !ended {
+			c.writeHeaderFrames(st.id, c.headerBlock(0, st.trailers, -1), true)
+		}
+		c.endStream(st)
+		return
+	}
+	st.out = append(st.out[:0], rem...)
+	c.pend(st)
+}
+
+// headerBlock кодирует блок заголовков ответа динамической таблицей HPACK
+// соединения: статус (status 0 — блок трейлеров, без статуса), поля и
+// content-length (cl < 0 — без него). Результат — в c.hbuf; блок нужно
+// сразу отправить (writeHeaderFrames), см. hpackEncoder.
+func (c *conn) headerBlock(status int, fields []hpField, cl int64) []byte {
+	hb := c.enc.begin(c.hbuf[:0])
+	if status != 0 {
+		hb = appendStatus(hb, status)
+	}
+	for i := range fields {
+		hb = c.enc.encode(hb, fields[i].name, fields[i].value)
+	}
+	if cl >= 0 {
+		hb = appendHpackInt(hb, 0x00, 4, 28) // content-length без индексирования: значения разные
 		hb = appendUintString(hb, uint64(cl))
 	}
 	c.hbuf = hb
-	endStream := len(resp.body) == 0
-	c.writeHeaderFrames(st.id, hb, endStream)
-	if endStream {
-		c.closeStream(st)
-		return nil
+	return hb
+}
+
+// endStream забывает поток, ответ которого ушёл целиком. Если клиент ещё
+// шлёт тело запроса, поток сбрасывается с NO_ERROR (RFC 9113 8.1), а поздние
+// кадры этого потока игнорируются.
+func (c *conn) endStream(st *stream) {
+	if st.halfClosed {
+		c.ringPush(st.id, false)
+	} else {
+		c.writeRST(st.id, codeNo)
+		c.ringPush(st.id, true)
 	}
-	rem := c.sendData(st.id, &st.sendWindow, resp.body)
-	if len(rem) == 0 {
-		c.closeStream(st)
-		return nil
+	c.release(st)
+}
+
+var errStreamClosed = errors.New("fasth2: stream closed")
+
+// flushQueue — первая часть Flush обработчика: HEADERS (один раз) и записанное
+// тело уходят в соединение, сколько позволяют окна. Возвращает поколение
+// потока для flushWait.
+func (c *conn) flushQueue(st *stream, resp *response) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || st.canceled {
+		return 0, errStreamClosed
 	}
-	st.out = append(st.out[:0], rem...)
-	st.pending = true
-	c.pending = append(c.pending, st)
-	if c.writeTO > 0 { // the client must grant flow-control credit in time
-		st.deadline = time.Now().Add(c.writeTO)
-		c.noteStreamDeadlineLocked(st.deadline)
+	c.queueResponseLocked(st, resp, false)
+	c.flushLocked()
+	return st.gen, nil
+}
+
+// flushWait — вторая часть Flush: ждёт, пока в очереди потока больше
+// maxStreamOut байт (клиент не даёт окна) или в буфере записи соединения больше
+// maxPendingWrite байт (клиент не читает сокет, писатель стоит в write). Первое
+// ограничено WriteByteTimeout на продвижение потока, второе — таймаутом записи.
+// gen отсекает поток, который уже обслуживает другой запрос.
+func (c *conn) flushWait(st *stream, gen uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for st.gen == gen && st.inHandler && !c.closed && !st.canceled && !c.baseDone {
+		if len(c.wbuf) > maxPendingWrite {
+			if c.writing {
+				c.parked++
+				c.wcond.Wait() // как drainLocked у читателя
+				c.parked--
+			} else {
+				c.flushLocked()
+			}
+			continue
+		}
+		if len(st.out) <= maxStreamOut {
+			break
+		}
+		c.parked++
+		st.cond.Wait()
+		c.parked--
+	}
+	switch {
+	case st.gen != gen || !st.inHandler:
+		return errWriteAfterHandler
+	case c.closed || st.canceled || c.baseDone:
+		return errStreamClosed
 	}
 	return nil
+}
+
+// queueResponseLocked переносит записанное тело в очередь потока и отправляет
+// его, сколько позволяют окна. final: обработчик вернулся, после тела уходят
+// трейлеры или END_STREAM.
+func (c *conn) queueResponseLocked(st *stream, resp *response, final bool) {
+	if !st.hdrSent {
+		c.writeHeaderFrames(st.id, c.headerBlock(resp.status, resp.fields, -1), false)
+		st.hdrSent = true
+	}
+	st.out = append(st.out, resp.body...)
+	resp.body = resp.body[:0]
+	if final {
+		st.respDone = true
+		if len(resp.trailers) > 0 {
+			st.trailers = resp.trailers
+		}
+	}
+	if c.sendOut(st) {
+		return // поток закрыт
+	}
+	if len(st.out) > 0 {
+		c.pend(st)
+	}
+}
+
+// pend ставит поток в очередь ответов, ждущих окна, и заводит срок продвижения.
+func (c *conn) pend(st *stream) {
+	if !st.pending {
+		st.pending = true
+		c.pending = append(c.pending, st)
+	}
+	if c.writeTO > 0 && st.wdeadline.IsZero() { // клиент должен вовремя дать окно
+		st.wdeadline = time.Now().Add(c.writeTO)
+		c.noteStreamDeadlineLocked(st.wdeadline)
+	}
+}
+
+// sendOut досылает st.out, сколько позволяют окна. Когда ответ готов целиком
+// (respDone) и всё ушло, отправляет трейлеры или END_STREAM и закрывает поток.
+// Возвращает true, если поток закрыт. Вызывающий снимает поток с c.pending.
+func (c *conn) sendOut(st *stream) bool {
+	before := len(st.out)
+	rem, ended := c.sendData(st.id, &st.sendWindow, st.out, st.respDone && len(st.trailers) == 0)
+	if len(rem) < before {
+		st.out = st.out[:copy(st.out, rem)]
+		st.cond.Broadcast() // Flush мог ждать, пока очередь потока уменьшится
+		if len(st.out) > 0 && c.writeTO > 0 {
+			// Продвинулись: срок сдвигается (c.streamDL остаётся нижней границей).
+			// Первая частичная отправка (Flush) срока ещё не имела — взводим его.
+			first := st.wdeadline.IsZero()
+			st.wdeadline = time.Now().Add(c.writeTO)
+			if first {
+				c.noteStreamDeadlineLocked(st.wdeadline)
+			}
+		}
+	}
+	if len(st.out) > 0 {
+		return false
+	}
+	st.wdeadline = time.Time{}
+	if !st.respDone {
+		return false
+	}
+	if !ended {
+		c.writeHeaderFrames(st.id, c.headerBlock(0, st.trailers, -1), true)
+	}
+	c.endStream(st)
+	return true
 }
 
 func (c *conn) writeHeaderFrames(sid uint32, hb []byte, endStream bool) {
@@ -1683,7 +2210,17 @@ func (c *conn) writeHeaderFrames(sid uint32, hb []byte, endStream bool) {
 	}
 }
 
-func (c *conn) sendData(sid uint32, win *int64, data []byte) []byte {
+// sendData пишет DATA-кадры из data, сколько позволяют окна потока и
+// соединения. end ставит END_STREAM на последний кадр; пустой data с end даёт
+// пустой DATA с END_STREAM (он не тратит окно). Возвращает неотправленный
+// остаток и true, если END_STREAM ушёл.
+func (c *conn) sendData(sid uint32, win *int64, data []byte, end bool) ([]byte, bool) {
+	if len(data) == 0 {
+		if end {
+			c.wbuf = appendFrameHeader(c.wbuf, 0, frData, flEndStream, sid)
+		}
+		return data, end
+	}
 	for len(data) > 0 {
 		n := int64(len(data))
 		if n > int64(c.peerMaxFrame) {
@@ -1696,10 +2233,11 @@ func (c *conn) sendData(sid uint32, win *int64, data []byte) []byte {
 			n = c.sendWindow
 		}
 		if n <= 0 {
-			break
+			return data, false
 		}
 		fl := byte(0)
-		if int(n) == len(data) {
+		last := int(n) == len(data)
+		if last && end {
 			fl = flEndStream
 		}
 		c.wbuf = appendFrameHeader(c.wbuf, int(n), frData, fl, sid)
@@ -1707,35 +2245,26 @@ func (c *conn) sendData(sid uint32, win *int64, data []byte) []byte {
 		*win -= n
 		c.sendWindow -= n
 		data = data[n:]
+		if last {
+			return data, end
+		}
 	}
-	return data
+	return data, false
 }
 
+// flushPending досылает ответы, которые ждали окна.
 func (c *conn) flushPending() {
 	if len(c.pending) == 0 {
 		return
 	}
 	j := 0
-	var now time.Time
 	for i := 0; i < len(c.pending); i++ {
 		st := c.pending[i]
-		before := len(st.out)
-		rem := c.sendData(st.id, &st.sendWindow, st.out)
-		if len(rem) == 0 {
-			st.pending = false
-			c.ringPush(st.id, false)
-			delete(c.streams, st.id)
-			c.recycle(st)
+		st.pending = false // sendOut → release не должен искать поток в c.pending
+		if c.sendOut(st) || len(st.out) == 0 {
 			continue
 		}
-		if len(rem) < before && c.writeTO > 0 {
-			// progress: extend the deadline (c.streamDL stays a valid lower bound)
-			if now.IsZero() {
-				now = time.Now()
-			}
-			st.deadline = now.Add(c.writeTO)
-		}
-		st.out = st.out[:copy(st.out, rem)]
+		st.pending = true
 		c.pending[j] = st
 		j++
 	}

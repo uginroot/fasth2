@@ -16,8 +16,20 @@ The design follows hyper/h2 rather than `net/http`:
 - one reader goroutine per connection, no goroutine + channels per frame;
 - handlers run on a worker pool; frames from many workers are coalesced into
   shared writes (write combining), one write per response instead of two;
+- a handler that finishes while other handlers of the same connection still run
+  yields the processor once, so responses that complete together leave in one
+  write (one write per ~50 responses at 16 connections × 64 streams on one core);
 - reusable buffers for frames, header blocks, requests and responses;
-- own HPACK decoder.
+- own HPACK decoder, and an encoder with a per-connection dynamic table: a repeated
+  response header block (`content-type`, `date`, `grpc-status`...) takes a few bytes;
+- h2c: the reader runs inside one `RawConn.Read` for the connection's life, so after a
+  short read it waits for readiness without the extra `read` that returns EAGAIN
+  (one `read` per round instead of two);
+- the `net/http` adapter builds one `http.Request` per request (not two), keeps all header
+  values in one array, parses simple paths without `url.ParseRequestURI`, and derives the
+  request context without registering it in the connection's context;
+- header strings that come from the HPACK table (repeated `user-agent`, `:authority`, `:path`,
+  gRPC headers) are made once per table entry, not once per request.
 
 ## Usage
 
@@ -34,6 +46,23 @@ If you build your own `tls.Listener`, add `"h2"` to `NextProtos`.
 
 Handlers run on fasth2 worker goroutines and may block, like under `net/http`.
 To change limits and timeouts, pass a `*fasth2.Server` instead of `nil` (see below).
+
+gRPC and streaming work through the same drop-in (checked with connect-go:
+Connect, gRPC and gRPC-Web, unary, server/client/bidi streaming, errors, deadlines,
+cancellation):
+
+- response trailers: `http.TrailerPrefix` keys and names declared in the `Trailer`
+  header, as in `net/http` (gRPC status goes this way);
+- `http.Flusher` / `http.ResponseController.Flush`: headers and the body written so
+  far leave at once; while more than 256 KiB of a stream's response waits for the
+  client's flow-control window, `Flush` blocks (bounded by `WriteByteTimeout`);
+- full duplex for streaming RPC: a request with `content-type: application/grpc*` or
+  `application/connect+*` and no `content-length` starts its handler as soon as its
+  body does not arrive within one read, and `r.Body` returns data as it arrives.
+  The stream's flow-control window is given back as the handler reads, so a fast
+  client waits for a slow handler instead of being reset, and at most one window
+  (1 MiB, or less with a smaller `MaxRequestBodySize`) of unread body is held per stream. Other requests are buffered whole
+  before the handler runs, as before.
 
 ## Benchmarks
 
@@ -62,6 +91,7 @@ Every push runs in CI:
 | RFC 7541 Appendix C | official HPACK examples with and without Huffman coding |
 | interop | curl, nghttp and h2load (h2c and TLS), Go `net/http` client, HTTP/1.1 fallback |
 | compatibility | `net/http` drop-in: gorilla/mux, `http.ServeMux`, context cancellation, `Shutdown`, large bodies |
+| streaming | `stream_test.go`: trailers (frames, flow control), `Flush` (backpressure, timeout, client reset, leftover goroutine), full duplex (ping-pong, early return, reset while reading, read timeout, body budget) |
 | fuzzing | `go test -fuzz` on the HPACK decoder, Huffman codec and whole connections through the `net/http` adapter (arbitrary frames after a valid preface); panics and hangs fail the run |
 | race detector | all tests run with `-race` on Go 1.24 and the latest Go |
 | security | `security_test.go`: Rapid Reset, non-reading client, header-list amplification, SETTINGS flood, blocked writer + connection error, handler panics, slot leak, buffer reuse after the handler returns, field validation, all timeouts, body budget, TLS policy |
@@ -85,13 +115,13 @@ connection starts).
 | `Server` field | default | from `http.Server` | what it bounds |
 |---|---|---|---|
 | `MaxConcurrentStreams` | 250 | — | open streams, **including streams reset by the client while their handler still runs** (Rapid Reset, CVE-2023-44487) |
-| `MaxRequestBodySize` | 16 MiB | — | one request body |
-| `MaxConnBodySize` | 64 MiB | — | request bodies buffered on one connection; a stream over it gets `REFUSED_STREAM` |
+| `MaxRequestBodySize` | 16 MiB | — | one request body buffered before the handler runs. Also caps the stream receive window we advertise (`min(1 MiB, MaxRequestBodySize)`, not below 64 KiB), so a streaming RPC holds at most that much unread; its total over the stream's life is not limited, as in `net/http` and gRPC (limit message size in the RPC layer, e.g. connect-go `WithReadMaxBytes`) |
+| `MaxConnBodySize` | 64 MiB | — | request body bytes buffered on one connection and not yet read by handlers; a stream over it gets `REFUSED_STREAM` (`ENHANCE_YOUR_CALM` if its handler already runs: `REFUSED_STREAM` would invite a retry) |
 | `MaxHeaderListSize` | 1 MiB | `MaxHeaderBytes` | decoded header list (name+value+32 per field); larger requests get 431 |
 | `HandshakeTimeout` | 10s | — | client preface + first SETTINGS |
-| `ReadTimeout` | 60s | `ReadTimeout` | HEADERS → END_STREAM of a request, and an unfinished header block |
+| `ReadTimeout` | 60s | `ReadTimeout` | HEADERS → END_STREAM of a request (also of a streaming RPC whose handler already runs: long bidi streams need a larger value), and an unfinished header block |
 | `IdleTimeout` | 120s | `IdleTimeout` (else `ReadTimeout`) | connection without open streams (then GOAWAY) |
-| `WriteByteTimeout` | 30s | `WriteTimeout` | one 64 KiB write chunk; waiting for flow-control credit |
+| `WriteByteTimeout` | 30s | `WriteTimeout` | one 64 KiB write chunk; waiting for flow-control credit (also inside `Flush`) |
 | `ErrorLog` | `log` | `ErrorLog` | where handler panics are logged |
 
 Also: a client that does not read stops being read (at most 256 KiB of output is queued
@@ -108,11 +138,11 @@ them); `net/http` queues such requests instead.
 
 ## Limitations
 
-- Drop-in adapter: no `http.Flusher` (SSE/streaming), `Hijacker`, 1xx responses or
-  trailers (so not for gRPC); request and response bodies are fully buffered.
+- Drop-in adapter: no `Hijacker` or 1xx responses; request trailers are not passed
+  to the handler. Request bodies are buffered whole before the handler runs, except
+  streaming RPC (see above); without `Flush`, the response is buffered whole too.
   `r.Body` and the `ResponseWriter` stop working when the handler returns
-  (reads/writes from a leftover goroutine get an error).
-- Response headers are HPACK-encoded without the dynamic table (slightly larger headers).
+  (reads, writes and `Flush` from a leftover goroutine get an error).
 - Stream priorities are ignored; no server push.
 
 ---
@@ -121,8 +151,9 @@ them); `net/http` queues such requests instead.
 
 Быстрый HTTP/2-сервер для Go: проходит все 146 тестов h2spec и подменяет HTTP/2
 в существующем `net/http`-сервисе одной строкой `fasth2.ConfigureServer(srv, nil)`.
-В тестах на gorilla/mux-приложении — ускорение ×2–3. Статус — экспериментальный: перед продом прогоните на
-стейдже и учтите ограничения выше (нет стриминга ответов). Лимиты и таймауты
+В тестах на gorilla/mux-приложении — ускорение ×2–3. Работают трейлеры ответа, `Flush` и full duplex
+для потоковых RPC, то есть gRPC и Connect (проверено с connect-go). Статус — экспериментальный: перед продом
+прогоните на стейдже и учтите ограничения выше. Лимиты и таймауты
 соединений включены по умолчанию, `ConfigureServer` берёт их из `http.Server`
 (см. «Limits and timeouts»).
 

@@ -88,9 +88,21 @@ var postBlock = []byte{0x83, 0x86, 0x84, 0x41, 0x09, 'l', 'o', 'c', 'a', 'l', 'h
 
 func u32(v uint32) []byte { return binary.BigEndian.AppendUint32(nil, v) }
 
+// grpcBlock — POST потокового RPC без content-length: обработчик запускается
+// до END_STREAM (full duplex).
+var grpcBlock = lit(append([]byte{}, postBlock...), "content-type", "application/grpc")
+
 func connSeeds() [][]byte {
 	cat := func(fs ...[]byte) []byte { return bytes.Join(fs, nil) }
 	return [][]byte{
+		cat(frame(frHeaders, flEndHeaders, 1, grpcBlock), frame(frData, 0, 1, []byte("ping")),
+			frame(frData, flEndStream, 1, []byte("pong"))),
+		cat(frame(frHeaders, flEndHeaders, 1, grpcBlock), frame(frData, 0, 1, []byte("ping")),
+			frame(frRSTStream, 0, 1, u32(8)), frame(frData, 0, 1, []byte("late"))),
+		cat(frame(frHeaders, flEndHeaders, 1, grpcBlock), frame(frData, 0, 1, []byte("ping")),
+			frame(frHeaders, flEndHeaders|flEndStream, 1, lit(nil, "grpc-status", "0"))),
+		cat(frame(frSettings, 0, 0, []byte{0, 4, 0, 0, 0, 0}), frame(frHeaders, flEndHeaders, 1, grpcBlock),
+			frame(frData, 0, 1, []byte("ping")), frame(frWindowUpdate, 0, 1, u32(3)), frame(frData, flEndStream, 1, nil)),
 		frame(frHeaders, flEndHeaders|flEndStream, 1, getBlock),
 		cat(frame(frHeaders, flEndHeaders, 1, postBlock), frame(frData, 0, 1, []byte("hello")),
 			frame(frData, flEndStream|flPadded, 1, []byte{2, 'x', 0, 0})),
@@ -110,10 +122,23 @@ func runFuzzConn(t *testing.T, data []byte) {
 	srvSide, cliSide := net.Pipe()
 	var panics panicLog
 	s := &Server{MaxConcurrentStreams: 100, MaxRequestBodySize: 1 << 20, ErrorLog: log.New(&panics, "", 0)}
+	// Эхо с Flush на каждый кусок и трейлер: так фаззер проходит потоковые
+	// ответы, чтение тела, которое ещё приходит, и трейлеры.
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Path", r.URL.Path)
-		io.Copy(w, r.Body)
+		buf := make([]byte, 512)
+		for {
+			n, err := r.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+				w.(http.Flusher).Flush()
+			}
+			if err != nil {
+				break
+			}
+		}
 		io.WriteString(w, "ok")
+		w.Header().Set(http.TrailerPrefix+"X-Done", "1")
 	})
 	done := make(chan struct{})
 	go func() { s.serveConn(srvSide, connOpts{handler: httpHandler(h)}); close(done) }()
