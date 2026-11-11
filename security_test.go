@@ -25,6 +25,11 @@ type tframe struct {
 	typ, flags byte
 	sid        uint32
 	p          []byte
+	// hdr — декодированный блок заголовков (у HEADERS, когда блок закончен).
+	// Сервер кодирует ответы с динамической таблицей HPACK, поэтому блоки
+	// декодируются по порядку в readLoop одним декодером на соединение.
+	hdr    map[string]string
+	hdrErr error
 }
 
 type tclient struct {
@@ -71,6 +76,9 @@ func (c *tclient) send(b ...[]byte) {
 func (c *tclient) readLoop() {
 	defer close(c.eof)
 	hdr := make([]byte, 9)
+	dec := newDecoder()
+	var block []byte
+	var held []tframe // HEADERS и CONTINUATION, пока блок не закончен
 	for {
 		if _, err := io.ReadFull(c.nc, hdr); err != nil {
 			return
@@ -80,7 +88,30 @@ func (c *tclient) readLoop() {
 		if _, err := io.ReadFull(c.nc, p); err != nil {
 			return
 		}
-		c.frames <- tframe{hdr[3], hdr[4], binary.BigEndian.Uint32(hdr[5:9]) & 0x7fffffff, p}
+		f := tframe{typ: hdr[3], flags: hdr[4], sid: binary.BigEndian.Uint32(hdr[5:9]) & 0x7fffffff, p: p}
+		if f.typ != frHeaders && f.typ != frContinuation {
+			c.frames <- f
+			continue
+		}
+		block = append(block, p...)
+		held = append(held, f)
+		if f.flags&flEndHeaders == 0 {
+			continue
+		}
+		var arena []byte
+		var fields []headerField
+		m := map[string]string{}
+		if _, err := dec.decode(block, &arena, &fields, 1<<20); err != nil {
+			held[0].hdrErr = err
+		}
+		for _, hf := range fields {
+			m[string(hf.Name)] = string(hf.Value)
+		}
+		held[0].hdr = m
+		for _, h := range held {
+			c.frames <- h
+		}
+		block, held = block[:0], held[:0]
 	}
 }
 
@@ -127,10 +158,16 @@ func (c *tclient) awaitEOF(d time.Duration) {
 	}
 }
 
-// status decodes :status from a response HEADERS frame (the server encodes
-// statelessly, so a fresh decoder works).
+// respFields возвращает поля блока заголовков HEADERS, декодированные в
+// readLoop по порядку (у сервера динамическая таблица HPACK).
 func respFields(t *testing.T, f tframe) map[string]string {
 	t.Helper()
+	if f.hdrErr != nil {
+		t.Fatalf("HPACK: %v", f.hdrErr)
+	}
+	if f.hdr != nil {
+		return f.hdr
+	}
 	d := newDecoder()
 	var arena []byte
 	var fields []headerField
@@ -593,9 +630,34 @@ func TestSecIdleTimeoutFromHTTPServer(t *testing.T) {
 func TestSecStreamReadTimeoutFromHTTPServer(t *testing.T) {
 	addr, _ := startMux(t, &http.Server{Handler: http.HandlerFunc(okHandler), ReadTimeout: 300 * time.Millisecond}, nil)
 	c := dialH2(t, addr, true)
-	c.send(headers(1, false, reqBlock("POST", "/"))) // body never comes
+	// С content-length тело буферизуется до запуска обработчика.
+	c.send(headers(1, false, reqBlock("POST", "/", "content-length", "1"))) // body never comes
 	if code := c.awaitRST(1); code != codeCancel {
 		t.Fatalf("RST code %d, want CANCEL", code)
+	}
+}
+
+// Потоковый RPC без content-length: обработчик запущен до END_STREAM и ждёт в Read.
+// ReadTimeout всё равно сбрасывает поток, а Read возвращает ошибку.
+func TestSecStreamReadTimeoutStreaming(t *testing.T) {
+	readErr := make(chan error, 1)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.ReadAll(r.Body)
+		readErr <- err
+	})
+	addr, _ := startMux(t, &http.Server{Handler: h, ReadTimeout: 300 * time.Millisecond}, nil)
+	c := dialH2(t, addr, true)
+	c.send(headers(1, false, reqBlock("POST", "/", "content-type", "application/grpc"))) // body never comes
+	if code := c.awaitRST(1); code != codeCancel {
+		t.Fatalf("RST code %d, want CANCEL", code)
+	}
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Fatal("Read вернул тело без ошибки после сброса")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("обработчик остался в Read")
 	}
 }
 
@@ -621,21 +683,92 @@ func TestSecPendingResponseTimeout(t *testing.T) {
 }
 
 func TestSecConnBodyBudget(t *testing.T) {
-	addr, _ := startMux(t, &http.Server{Handler: http.HandlerFunc(okHandler)}, &Server{MaxConnBodySize: 1 << 20, MaxRequestBodySize: 512 << 10})
+	testConnBodyBudget(t, http.HandlerFunc(okHandler), "content-length", "409600")
+}
+
+// Потоковый RPC без content-length: тело ограничивает окно соединения
+// (MaxConnBodySize), а не сброс по бюджету. Окно соединения за непрочитанные
+// байты не возвращается, пока обработчики не прочтут их; клиент, который
+// соблюдает окна, ждёт и не получает сброс.
+func TestSecConnBodyBudgetStreaming(t *testing.T) {
+	release := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, "ok")
+	})
+	addr, _ := startMux(t, &http.Server{Handler: h}, &Server{MaxConnBodySize: 1 << 20, MaxRequestBodySize: 512 << 10})
+	c := dialH2(t, addr, true)
+	c.await(2*time.Second, "WINDOW_UPDATE соединения из preface сервера", func(f tframe) bool {
+		return f.typ == frWindowUpdate && f.sid == 0
+	})
+	chunk := make([]byte, 16<<10)
+	var b []byte
+	for sid := uint32(1); sid <= 3; sid += 2 {
+		b = append(b, headers(sid, false, reqBlock("POST", "/", "content-type", "application/grpc"))...)
+		for i := 0; i < 25; i++ { // 400 КиБ на поток, 800 КиБ всего — в пределах окна соединения 1 МиБ
+			b = append(b, frame(frData, 0, sid, chunk)...)
+		}
+	}
+	c.send(b)
+	deadline := time.After(300 * time.Millisecond)
+wait:
+	for {
+		select {
+		case f := <-c.frames:
+			if f.typ == frRSTStream || f.typ == frGoAway {
+				t.Fatalf("сброс (тип %d) при теле в пределах окон", f.typ)
+			}
+			if f.typ == frWindowUpdate && f.sid == 0 {
+				t.Fatal("окно соединения вернулось, хотя обработчики не читали")
+			}
+		case <-deadline:
+			break wait
+		}
+	}
+	close(release)
+	c.await(2*time.Second, "WINDOW_UPDATE соединения после чтения", func(f tframe) bool {
+		return f.typ == frWindowUpdate && f.sid == 0
+	})
+	c.send(frame(frData, flEndStream, 1, nil), frame(frData, flEndStream, 3, nil))
+	for _, sid := range []uint32{1, 3} {
+		if st := c.awaitStatus(sid); st != "200" {
+			t.Fatalf("stream %d: status %q", sid, st)
+		}
+	}
+}
+
+func testConnBodyBudget(t *testing.T, h http.Handler, extra ...any) {
+	var hdr []string
+	var release chan struct{}
+	for _, x := range extra {
+		switch v := x.(type) {
+		case string:
+			hdr = append(hdr, v)
+		case chan struct{}:
+			release = v
+		}
+	}
+	addr, _ := startMux(t, &http.Server{Handler: h}, &Server{MaxConnBodySize: 1 << 20, MaxRequestBodySize: 512 << 10})
 	c := dialH2(t, addr, true)
 	chunk := make([]byte, 16<<10)
 	var b []byte
 	for sid := uint32(1); sid <= 5; sid += 2 {
-		b = append(b, headers(sid, false, reqBlock("POST", "/"))...)
+		b = append(b, headers(sid, false, reqBlock("POST", "/", hdr...))...)
 		for i := 0; i < 25; i++ { // 400 KiB per stream
 			b = append(b, frame(frData, 0, sid, chunk)...)
 		}
 	}
 	c.send(b)
+	// Буферизованное тело: обработчик не запущен — REFUSED_STREAM (можно повторить).
 	if code := c.awaitRST(5); code != codeRefusedStream {
 		t.Fatalf("third stream: RST code %d, want REFUSED_STREAM", code)
 	}
 	c.send(frame(frData, flEndStream, 1, nil), frame(frData, flEndStream, 3, nil))
+	if release != nil {
+		release <- struct{}{} // отпустить оба обработчика
+		release <- struct{}{}
+	}
 	for _, sid := range []uint32{1, 3} {
 		if st := c.awaitStatus(sid); st != "200" {
 			t.Fatalf("stream %d: status %q", sid, st)
